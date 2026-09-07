@@ -6,7 +6,8 @@ use crate::{
     ENABLE_CHECK_MODE, F32, INPUT_KEYS_NUMBERS, INSIDE_COLOR, INSIDE_HALF_HEIGHT,
     INSIDE_HALF_WIDTH, LAST_DELAY_VALUE_TAKEOVER, MEMORY_RECEIVER_ALLOC, MEMORY_RECEIVER_FREE,
     NEXT_DRAW_ROLLBACK, OUTER_COLOR, OUTER_HALF_HEIGHT, OUTER_HALF_WIDTH, PROGRESS_COLOR,
-    REAL_INPUT, REAL_INPUT2, SMOOTH, SMOOTH_ENABLED_CONFIG, SOKU_FRAMECOUNT, TAKEOVER_COLOR,
+    set_input_buffers, set_input_buffers_opt, SMOOTH, SMOOTH_ENABLED_CONFIG, SOKU_FRAMECOUNT,
+    TAKEOVER_COLOR,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -22,6 +23,7 @@ use winapi::shared::{
     d3d9types::{D3DCLEAR_TARGET, D3DRECT},
 };
 use windows::Win32::System::Console::AllocConsole;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
 struct RePlayRePlay {
     frame: usize,
@@ -75,7 +77,7 @@ impl RePlayRePlay {
             //     self.p2_inputs.get(&fc).is_some()
             // );
 
-            REAL_INPUT = if self.p1_inputs.get(&fc).is_none()
+            let p1 = if self.p1_inputs.get(&fc).is_none()
                 && REPLAY_KO_FRAMECOUNT == Some(*SOKU_FRAMECOUNT)
             {
                 Some([false; INPUT_KEYS_NUMBERS])
@@ -83,7 +85,7 @@ impl RePlayRePlay {
                 self.p1_inputs.get(&fc).copied()
             };
 
-            REAL_INPUT2 = self.p2_inputs.get(&fc).copied();
+            set_input_buffers_opt(&[p1, self.p2_inputs.get(&fc).copied()]);
         }
     }
 }
@@ -324,6 +326,26 @@ struct PlayerData {
 }
 
 impl PlayerData {
+    /// Names the fields that differ, prefixed with `tag` ("p1".."p4").
+    ///
+    /// The sync test's useful output is not THAT a snapshot differed but WHICH
+    /// player's did. P1/P2 diverging would mean the test itself is broken,
+    /// since 2P rollback demonstrably works in shipped giuroll; P3/P4
+    /// diverging alone is the missing-coverage answer it was run to get. A
+    /// bare `!=` cannot tell those apart.
+    fn diff_into(&self, other: &Self, tag: &str, out: &mut Vec<String>) {
+        macro_rules! cmp {
+            ($($n:ident),* $(,)?) => {$(
+                if self.$n != other.$n {
+                    out.push(format!("{}.{}", tag, stringify!($n)));
+                }
+            )*};
+        }
+        cmp!(
+            x_pos, y_pos, x_speed, y_speed, gravity, dir, health, hit_state, untech,
+        );
+    }
+
     pub unsafe fn from_player(p_player: *const c_void) -> Self {
         let p_player = p_player as *const u8;
         Self {
@@ -349,19 +371,144 @@ impl PlayerData {
         }
     }
 }
+/// Has 4PSoku been loaded yet? 1 = yes, anything else = not seen yet.
+static FOUR_PLAYER_MOD: AtomicU8 = AtomicU8::new(0);
+
+/// Is 4PSoku loaded?
+///
+/// LATCHES ON TRUE ONLY, and that asymmetry is the whole point.
+///
+/// This used to cache whichever answer it got first. The first call happens
+/// during giuroll's own Initialize -- and with a loader that starts giuroll
+/// before 4PSoku, that is BEFORE 4PSoku.dll exists in the process. It then
+/// cached "absent" for the rest of the session, and every 4P feature quietly
+/// switched itself off: P3 and P4 dropped out of savestates, the local slot
+/// never resolved so the netcode ran as 2 players, and the mesh never sent a
+/// single hole-punch. Nothing failed loudly; the game just behaved as though
+/// 4PSoku were not installed, on one machine and not the other, because the two
+/// players' loaders disagreed about order. ModLoaderSettings.json sorts
+/// alphabetically and puts 4PSoku first; SWRSToys.ini lists giuroll first.
+///
+/// A module is never unloaded here, so `true` is permanent and `false` only
+/// ever means "not yet". GetModuleHandleA is a lookup in the loader's own list,
+/// cheap enough for the per-savestate callers to repeat until it succeeds.
+pub(crate) fn four_player_mod_loaded() -> bool {
+    if FOUR_PLAYER_MOD.load(Relaxed) == 1 {
+        return true;
+    }
+
+    let loaded = unsafe { GetModuleHandleA(windows::core::s!("4PSoku.dll")) }
+        .is_ok_and(|h| !h.is_invalid());
+
+    if loaded {
+        FOUR_PLAYER_MOD.store(1, Relaxed);
+    }
+    loaded
+}
+
+/// Which of the four seats this client occupies, or None outside a 4P session.
+///
+/// Only 4PSoku's server knows this -- it assigns the slot when a player joins
+/// and acks it -- so it is asked rather than inferred. A rollback netcode that
+/// guesses its own slot puts every remote player in control of the wrong
+/// character, and does so silently.
+///
+/// Fetched through GetProcAddress rather than read from a fixed address because
+/// 4PSoku.dll's base moves between launches, which is not hypothetical: two
+/// consecutive runs during this work reported 0x73007690 and 0x6ee67690 for the
+/// same static.
+pub(crate) fn four_player_local_slot() -> Option<usize> {
+    if !four_player_mod_loaded() {
+        return None;
+    }
+    unsafe {
+        let module = GetModuleHandleA(windows::core::s!("4PSoku.dll")).ok()?;
+        let proc = GetProcAddress(module, windows::core::s!("FourPSokuLocalSlot"))?;
+        let get_slot: extern "C" fn() -> i32 = std::mem::transmute(proc);
+        // -1 means no slot held: not in a 4P session, or not joined yet.
+        match get_slot() {
+            slot @ 0..=3 => Some(slot as usize),
+            _ => None,
+        }
+    }
+}
+
+/// 4PSoku's P3/P4, or None when this is an ordinary 1v1.
+///
+/// The mod puts them in the battle manager's own CharacterManager* array: it
+/// does `(CharacterManager**)(battleManager + 0x0C)` and indexes 0..3, so P3
+/// and P4 are simply the two slots after the pair giuroll already checks.
+/// Confirmed live 2026-09-02 -- four independent HP values in a real 2v2.
+///
+/// LOADED IS NOT SUFFICIENT. 4PSoku stays loaded for the whole session,
+/// including vanilla 1v1, practice and replays, and at those offsets the
+/// engine leaves whatever was there last. Reading them then would compare two
+/// stale CharacterManagers that agree with each other perfectly and make a
+/// broken savestate look correct -- silently weakening the very check this
+/// exists to perform. So the pointers are range-checked, and the whole thing
+/// is None unless BOTH are plausible.
+unsafe fn four_player_assists(bm: *const u8) -> Option<(PlayerData, PlayerData)> {
+    if !four_player_mod_loaded() {
+        return None;
+    }
+    let plausible = |p: *const c_void| {
+        let a = p as usize;
+        a >= 0x00400000 && a < 0x7FFF0000
+    };
+    let p3 = *ptr_wrap!(bm.offset(0x14) as *const *const c_void);
+    let p4 = *ptr_wrap!(bm.offset(0x18) as *const *const c_void);
+    if !plausible(p3) || !plausible(p4) {
+        return None;
+    }
+    Some((PlayerData::from_player(p3), PlayerData::from_player(p4)))
+}
+
 #[derive(Eq, PartialEq, Debug)]
-struct CheckData {
+pub(crate) struct CheckData {
     p1_data: PlayerData,
     p2_data: PlayerData,
+    /// P3/P4 under 4PSoku. None in a vanilla 1v1 -- and then None on BOTH
+    /// sides of every comparison, so 2P checking behaves exactly as before.
+    assists: Option<(PlayerData, PlayerData)>,
     battle_state: u32,
 }
 
 impl CheckData {
-    pub unsafe fn from_battle() -> Self {
+    /// True when this snapshot actually carries P3/P4. A sync test that
+    /// reports "no difference" while this is false has proven nothing about
+    /// the 2v2 state, which is the only thing it was run to check.
+    pub(crate) fn has_assists(&self) -> bool {
+        self.assists.is_some()
+    }
+
+    /// Every field that differs between two snapshots, as "p3.x_pos" names.
+    pub(crate) fn diff_fields(&self, other: &Self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.p1_data.diff_into(&other.p1_data, "p1", &mut out);
+        self.p2_data.diff_into(&other.p2_data, "p2", &mut out);
+        match (&self.assists, &other.assists) {
+            (Some((a3, a4)), Some((b3, b4))) => {
+                a3.diff_into(b3, "p3", &mut out);
+                a4.diff_into(b4, "p4", &mut out);
+            }
+            (None, None) => (),
+            // One side saw P3/P4 and the other did not. Worth its own name:
+            // it means a pointer stopped being plausible mid-match, which is a
+            // different bug from a value not surviving the round trip.
+            _ => out.push("assists.presence".to_string()),
+        }
+        if self.battle_state != other.battle_state {
+            out.push("battle_state".to_string());
+        }
+        out
+    }
+
+    pub(crate) unsafe fn from_battle() -> Self {
         let p_battle_manager = *(0x008985E4 as *const *const u8);
         Self {
             p1_data: PlayerData::from_player(*(p_battle_manager.offset(0xc) as *const _)),
             p2_data: PlayerData::from_player(*(p_battle_manager.offset(0x10) as *const _)),
+            assists: four_player_assists(p_battle_manager),
             battle_state: *(p_battle_manager.offset(0x88) as *const u32),
         }
     }
@@ -450,8 +597,7 @@ pub unsafe fn handle_replay(
             true => false,
         }
     }
-    REAL_INPUT = None;
-    REAL_INPUT2 = None;
+    set_input_buffers_opt(&[]);
 
     //let scheme = [0x02, 0x03, 0x04, 0x05];
     //let scheme = [0x10, 0x11, 0x12, 0x13];
@@ -563,9 +709,7 @@ pub unsafe fn handle_replay(
         ret
     }
     unsafe fn apply_old_input() {
-        REAL_INPUT = Some(get_input(false));
-        REAL_INPUT2 = Some(get_input(true));
-        // println!("{:?} {:?}", REAL_INPUT, REAL_INPUT2);
+        set_input_buffers(&[get_input(false), get_input(true)]);
     }
     if let Some(check) = CHECK.as_mut() {
         unsafe fn check_failed() {

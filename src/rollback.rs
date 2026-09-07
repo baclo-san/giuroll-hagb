@@ -15,7 +15,7 @@ use windows::Win32::Foundation::HANDLE;
 #[allow(unused_imports)]
 use crate::println;
 use crate::{
-    ptr_wrap, set_input_buffer, soku_heap_free, Callbacks, CameraTransform, CALLBACK_ARRAY,
+    ptr_wrap, set_input_buffers, soku_heap_free, Callbacks, CameraTransform, CALLBACK_ARRAY,
     INPUT_KEYS_NUMBERS, ISDEBUG, LAST_CAMERA_BEFORE_SMOOTH, MEMORY_RECEIVER_ALLOC,
     MEMORY_RECEIVER_FREE, SOKU_FRAMECOUNT, SOUND_MANAGER,
 };
@@ -98,6 +98,15 @@ impl EnemyInputHolder {
 pub struct Rollbacker {
     pub guessed: Vec<RollFrame>,
 
+    /// How many players this match has, and which slot is ours.
+    ///
+    /// Slots are in the engine's input-poll order, verified 2026-09-03 to be
+    /// P1, P2, P3, P4. Indexing everything by slot is what removes the old
+    /// `is_p1` swap: with one opponent you can get away with "mine and theirs"
+    /// and reorder at the end, but with three there is no such pair to swap.
+    players: usize,
+    local_slot: usize,
+
     current: usize,
     rolling_back: bool,
 
@@ -109,23 +118,99 @@ pub struct Rollbacker {
     // which we hook, and set a static to ignore the sound.
 
     //also, while rolling back, we should not play sounds that already did appear in past_sounds (and instead remove them, so we can see what is)
-    pub enemy_inputs: EnemyInputHolder,
+    /// One stream per slot, indexed by slot. Our own slot's entry is unused --
+    /// our input is never guessed, so it lives in `self_inputs` instead.
+    pub enemy_inputs: Vec<EnemyInputHolder>,
     pub self_inputs: Vec<RInput>,
 
     pub weathers: HashMap<usize, u8>,
 }
 
 impl Rollbacker {
-    pub fn new() -> Self {
+    pub fn new(players: usize, local_slot: usize) -> Self {
+        assert!(players >= 2 && local_slot < players);
         Self {
             guessed: Vec::new(),
+            players,
+            local_slot,
             current: 0,
             rolling_back: false,
-            enemy_inputs: EnemyInputHolder::new(),
+            enemy_inputs: (0..players).map(|_| EnemyInputHolder::new()).collect(),
             self_inputs: Vec::new(),
             weathers: HashMap::new(),
             // future_sound: HashMap::new(),
         }
+    }
+
+    pub fn players(&self) -> usize {
+        self.players
+    }
+
+    pub fn local_slot(&self) -> usize {
+        self.local_slot
+    }
+
+    /// Record a peer's real input for a slot.
+    pub fn insert_input(&mut self, slot: usize, input: RInput, frame: usize) {
+        debug_assert_ne!(slot, self.local_slot, "our own input is not received");
+        self.enemy_inputs[slot].insert(input, frame);
+    }
+
+    /// Every slot's input for a frame, guessing for peers we have not heard
+    /// from. In slot order, ready to hand straight to the input queue.
+    fn all_inputs(&self, frame: usize) -> Vec<RInput> {
+        Self::all_inputs_at(
+            self.players,
+            self.local_slot,
+            &self.enemy_inputs,
+            &self.self_inputs,
+            frame,
+        )
+    }
+
+    /// As `all_inputs`, but taking its inputs as pieces.
+    ///
+    /// `step` holds a `&mut` into `guessed` while it needs this, so it cannot
+    /// also borrow `&self`. Splitting the fields out is the least clever way
+    /// around that and keeps the borrow obvious at the call site.
+    fn all_inputs_at(
+        players: usize,
+        local_slot: usize,
+        enemy_inputs: &[EnemyInputHolder],
+        self_inputs: &[RInput],
+        frame: usize,
+    ) -> Vec<RInput> {
+        (0..players)
+            .map(|slot| {
+                if slot == local_slot {
+                    self_inputs[frame]
+                } else {
+                    enemy_inputs[slot].get(frame)
+                }
+            })
+            .collect()
+    }
+
+    /// Every slot's input for a frame, but only if NOTHING is still a guess.
+    ///
+    /// The distinction from `all_inputs` is the whole point of this being
+    /// N-player: with one opponent, "we have heard from them" and "the frame is
+    /// settled" are the same statement, so the two functions collapse into one
+    /// and the difference is easy not to notice. With three, a frame is settled
+    /// only when the slowest of them has been heard from.
+    fn confirmed_inputs(&self, frame: usize) -> Option<Vec<RInput>> {
+        let mut out = Vec::with_capacity(self.players);
+        for slot in 0..self.players {
+            if slot == self.local_slot {
+                out.push(*self.self_inputs.get(frame)?);
+            } else {
+                match self.enemy_inputs[slot].get_result(frame) {
+                    Ok(x) => out.push(x),
+                    Err(_) => return None,
+                }
+            }
+        }
+        Some(out)
     }
 
     /// fill in inputs before calling this function
@@ -135,11 +220,9 @@ impl Rollbacker {
         //let newsound = std::mem::replace(&mut *SOUNDS_THAT_DID_HAPPEN.lock().unwrap(), BTreeMap::new());
 
         while self.guessed.len() > 0
-            && (self
-                .enemy_inputs
-                .get_result(self.guessed[0].prev_state.number)
-                .map(|x| x == self.guessed[0].enemy_input)
-                .unwrap_or(false))
+            && self
+                .confirmed_inputs(self.guessed[0].prev_state.number)
+                .is_some_and(|known| known == self.guessed[0].inputs)
         {
             let mut m = self.guessed.remove(0);
 
@@ -160,19 +243,16 @@ impl Rollbacker {
         self.guessed.len() + 1
     }
 
-    fn apply_input(input: RInput, opponent_input: RInput) {
+    /// Hand one frame's inputs to the engine, in slot order.
+    ///
+    /// No p1/p2 swap here any more. The old code kept "my input" and "their
+    /// input" and reordered at the last moment depending on which end we were;
+    /// once inputs are stored by slot there is nothing to reorder, and the
+    /// swap becomes a bug waiting for a third player.
+    fn apply_inputs(inputs: &[RInput]) {
         #[cfg(feature = "logrollback")]
-        println!("apply input {:?}", opponent_input);
-        let is_p1 = unsafe {
-            let netmanager = *(0x8986a0 as *const usize);
-            *ptr_wrap!(netmanager as *const usize) == 0x858cac
-        };
-
-        if is_p1 {
-            unsafe { set_input_buffer(input, opponent_input) };
-        } else {
-            unsafe { set_input_buffer(opponent_input, input) };
-        }
+        println!("apply inputs {:?}", inputs);
+        unsafe { set_input_buffers(inputs) };
     }
 
     pub fn step(&mut self, iteration_number: usize) -> Option<()> {
@@ -228,10 +308,9 @@ impl Rollbacker {
 
             let current = unsafe { *SOKU_FRAMECOUNT };
 
-            let si = self.self_inputs[current];
-            let ei = self.enemy_inputs.get(current);
-            Self::apply_input(si, ei);
-            self.guessed.push(RollFrame::dump_with_guess(si, ei));
+            let inputs = self.all_inputs(current);
+            Self::apply_inputs(&inputs);
+            self.guessed.push(RollFrame::dump_with_guess(inputs));
 
             Some(())
         } else {
@@ -250,10 +329,24 @@ impl Rollbacker {
                     //    b.insert(a);
                     //}
                 };
-                fr.enemy_input = self.enemy_inputs.get(fr.prev_state.number);
-                Self::apply_input(fr.player_input, fr.enemy_input);
+                fr.inputs = Self::all_inputs_at(
+                    self.players,
+                    self.local_slot,
+                    &self.enemy_inputs,
+                    &self.self_inputs,
+                    fr.prev_state.number,
+                );
+                Self::apply_inputs(&fr.inputs);
                 Some(())
-            } else if fr.enemy_input != self.enemy_inputs.get(fr.prev_state.number) {
+            } else if fr.inputs
+                != Self::all_inputs_at(
+                    self.players,
+                    self.local_slot,
+                    &self.enemy_inputs,
+                    &self.self_inputs,
+                    fr.prev_state.number,
+                )
+            {
                 //info!("ROLLBACK");
                 unsafe {
                     let manager = SOUND_MANAGER.as_mut().unwrap();
@@ -269,8 +362,14 @@ impl Rollbacker {
                 println!("restore {}", fr.prev_state.number);
                 //fr.prev_state.clone().never_happened();
 
-                fr.enemy_input = self.enemy_inputs.get(fr.prev_state.number);
-                Self::apply_input(fr.player_input, fr.enemy_input);
+                fr.inputs = Self::all_inputs_at(
+                    self.players,
+                    self.local_slot,
+                    &self.enemy_inputs,
+                    &self.self_inputs,
+                    fr.prev_state.number,
+                );
+                Self::apply_inputs(&fr.inputs);
                 Some(())
             } else {
                 None
@@ -283,23 +382,19 @@ impl Rollbacker {
 
 pub struct RollFrame {
     pub prev_state: Frame,
-    pub player_input: RInput,
-    pub enemy_input: RInput,
+    /// What this frame was actually simulated with, one entry per slot.
+    pub inputs: Vec<RInput>,
 }
 
 pub static mut LAST_M_LEN: usize = 0;
 
 impl RollFrame {
-    fn dump_with_guess(player_input: RInput, guess: RInput) -> Self {
+    fn dump_with_guess(inputs: Vec<RInput>) -> Self {
         let prev_state = unsafe { dump_frame(None::<Empty<_>>, None::<Empty<_>>) };
         #[cfg(feature = "logrollback")]
         println!("dump {} with guess", prev_state.number);
 
-        Self {
-            prev_state,
-            player_input: player_input,
-            enemy_input: guess,
-        }
+        Self { prev_state, inputs }
     }
 }
 static mut FPST: [u8; 108] = [0u8; 108];
@@ -540,6 +635,41 @@ pub unsafe fn dump_frame(
     };
 
     unsafe fn read_player_data(player: usize, m: &mut Vec<ReadAddr>) {
+        // This player's input accumulators.
+        //
+        // They live in the KeymapManager, not in the character: running counts
+        // of how many frames each direction and button has been held. Moves are
+        // decided from those counts -- a backdash is a double tap, not a
+        // direction -- and the character's own copy at +0x754 is derived from
+        // them rather than the other way round. Leaving them out of the
+        // savestate means a restored frame re-simulates against an input
+        // history that was never rewound, so a different move comes out of
+        // identical player state.
+        //
+        // Measured 2026-09-03 with the local sync test: 200 of 200 re-simulated
+        // frames read a different history than their first run, and 14 of them
+        // diverged visibly -- a backdash in one run and standing still in the
+        // other, from the same state and the same inputs.
+        //
+        // Derived from the player rather than from a pair of fixed globals
+        // because under 4PSoku the assist players' KeymapManagers live inside
+        // 4PSoku.dll, not in the game. Restoring into a module's data section is
+        // fine, it is memory like any other, but its address is not knowable
+        // ahead of time.
+        {
+            let plausible = |a: usize| (0x00400000..0x7fff0000).contains(&a);
+            let key_manager = *ptr_wrap!((player + 0x750) as *const usize);
+            if plausible(key_manager) {
+                let keymap_manager = *ptr_wrap!(key_manager as *const usize);
+                if plausible(keymap_manager) {
+                    // sizeof(KeymapManager): vtable, KeyBindings (13 ints),
+                    // KeyInput (10 ints), inKeys, outKeys, readInKeys -- 0x65
+                    // rounded up to alignment.
+                    m.push(read_addr(keymap_manager, 0x68));
+                }
+            }
+        }
+
         let read_bullets = |pos: usize, char: u8, m: &mut Vec<_>| {
             let list = read_linked_list(pos);
 
@@ -734,9 +864,54 @@ pub unsafe fn dump_frame(
     let p2 = get_player(p_game_manager, 1).unwrap();
     read_player_data(p2, &mut m);
 
-    // dumping characters (players) data for 2v2 mod
-    get_player(p_game_manager, 2).and_then(|p| Some(read_player_data(p, &mut m)));
-    get_player(p_game_manager, 3).and_then(|p| Some(read_player_data(p, &mut m)));
+    // P3/P4 under the 2v2 mod.
+    //
+    // These two lines have never actually dumped anything. get_player gates on
+    // enabledPlayers (gameDataManager+0x38), which is the vanilla engine's
+    // slot table, and nothing sets it for slots 2 and 3: createPlayer
+    // (0x46DA40) writes players[slot] at +0x28 and stops -- its whole
+    // registration epilogue is `mov [ebx+eax*4+0x28], esi` at 0x46DE3A -- and
+    // 4PSoku, which is what puts players in those slots, never writes
+    // enabledPlayers itself. So the gate reads 0, both calls return None, and
+    // the assist pair sits in no savestate at all. A 1-frame local rollback
+    // test disagreed with itself on 126 of 200 frames; the per-field tally
+    // that says which players those were came later, so read that number as
+    // consistent with this cause rather than as proof of it.
+    //
+    // Cross-check the two structures the mod DOES populate instead of the one
+    // it does not. Both must name the same object, it must be a plausible
+    // pointer, and its character id must be one read_player_data can size.
+    // That last check is not belt-and-braces: 4PSoku stays loaded through
+    // vanilla 1v1, practice and replays, where these slots hold whatever was
+    // left behind, and a stale pointer would otherwise sail through and assert
+    // deep inside the dump -- or compute a garbage length, which is how the
+    // "size too big" panic looked.
+    let assist_player = |n: usize| -> Option<usize> {
+        if !crate::replay::four_player_mod_loaded() {
+            return None;
+        }
+        let from_game = *ptr_wrap!((p_game_manager + 0x28 + n * 4) as *const usize);
+        let from_battle = *ptr_wrap!((p_battle_manager + 0xc + n * 4) as *const usize);
+        if from_game == 0 || from_game != from_battle {
+            return None;
+        }
+        if !(0x00400000..0x7fff0000).contains(&from_game) {
+            return None;
+        }
+        let char = *ptr_wrap!((from_game + 0x34c) as *const u8) as usize;
+        if char >= CHARSIZEDATA.len() || CHARSIZEDATA[char].0 == 0 {
+            return None;
+        }
+        Some(from_game)
+    };
+
+    for n in [2usize, 3usize] {
+        // enabledPlayers first, so a future engine or mod that does set it
+        // keeps working through the path it expects.
+        if let Some(p) = get_player(p_game_manager, n).or_else(|| assist_player(n)) {
+            read_player_data(p, &mut m);
+        }
+    }
 
     assert_eq!(*((p_battle_manager + 0xc + 0 * 4) as *const usize), p1);
     assert_eq!(*((p_battle_manager + 0xc + 1 * 4) as *const usize), p2);

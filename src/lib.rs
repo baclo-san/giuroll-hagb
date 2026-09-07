@@ -22,12 +22,14 @@ use std::{
     path::{Path, PathBuf},
     ptr::{addr_of_mut, null_mut},
     sync::{
-        atomic::{AtomicI32, AtomicU32, Ordering::Relaxed},
+        atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering::Relaxed},
         Mutex,
     },
     time::{Duration, Instant},
 };
+mod mesh;
 mod netcode;
+mod peers;
 mod replay;
 mod rollback;
 mod sound;
@@ -108,6 +110,66 @@ pub fn set_up_fern() -> Result<(), fern::InitError> {
 
 static mut ENABLE_PRINTLN: bool = false;
 
+/// Where giuroll.log is written. Set during init, next to giuroll.ini.
+static LOG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static LOG_LINES: AtomicUsize = AtomicUsize::new(0);
+
+/// Enough to cover a whole session; small enough that a site which fires every
+/// frame on a bad connection cannot fill a disk or spend the frame budget on
+/// flushes. Being cut off is stated in the file rather than left as a silence.
+const LOG_LINE_CAP: usize = 20000;
+
+/// Append one diagnostic line to giuroll.log.
+///
+/// WHY A FILE AND NOT JUST STDOUT. `enable_println` decides whether these lines
+/// are produced, not whether anyone can read them -- and until now the answer to
+/// the second question was usually no. AllocConsole sits behind a COMPILE-TIME
+/// cargo feature (`allocconsole`), so a stock release build prints into a stdout
+/// that was never attached to anything and every line is silently discarded.
+/// The ini says logging is on, nothing appears, and there is no clue why.
+///
+/// A file is the better destination here regardless: it survives the crash you
+/// most want to read about, and players on three continents can paste it
+/// without fighting a console window's selection behaviour.
+pub fn log_line(line: &str) {
+    use std::io::Write;
+
+    let n = LOG_LINES.fetch_add(1, Relaxed);
+
+    if n > LOG_LINE_CAP {
+        return;
+    }
+
+    let Ok(mut file) = LOG_FILE.lock() else {
+        return;
+    };
+
+    if file.is_none() {
+        let Ok(path) = LOG_PATH.lock() else {
+            return;
+        };
+        let Some(path) = path.as_ref() else {
+            return;
+        };
+        *file = std::fs::File::create(path).ok();
+    }
+
+    let Some(file) = file.as_mut() else {
+        return;
+    };
+
+    if n == LOG_LINE_CAP {
+        let _ = writeln!(file, "[giuroll: log capped at {} lines]", LOG_LINE_CAP);
+        return;
+    }
+
+    let _ = writeln!(file, "{}", line);
+    // Flushed per line on purpose: the interesting runs are the ones that end
+    // in a crash, and a buffered tail is exactly the part that would be lost.
+    let _ = file.flush();
+}
+
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {{
@@ -116,6 +178,7 @@ macro_rules! println {
         #[allow(unused_unsafe)]
         if unsafe { ENABLE_PRINTLN } || unsafe { CHECK.is_some() } {
             std::println!($($arg)*);
+            crate::log_line(&std::format!($($arg)*));
         }
     }};
 }
@@ -344,8 +407,50 @@ pub extern "cdecl" fn CheckVersion(a: *const [u8; 16]) -> bool {
 
 const INPUT_KEYS_NUMBERS: usize = 12;
 
-static mut REAL_INPUT: Option<[bool; INPUT_KEYS_NUMBERS]> = None;
-static mut REAL_INPUT2: Option<[bool; INPUT_KEYS_NUMBERS]> = None;
+/// How many players' inputs can be injected into one frame. Vanilla polls
+/// twice per frame, 4PSoku four times; the spare slots go unused at 1v1.
+const MAX_INJECTED_PLAYERS: usize = 4;
+
+/// One frame's injected inputs, consumed in poll order by handle_raw_input.
+///
+/// This used to be a pair of Options shifted along with mem::replace, which is
+/// the same thing for two players and quietly wrong for four: the third and
+/// fourth polls found None and fell through to the real hardware read, so
+/// under 4PSoku P3 and P4 were driven by whoever was holding a controller
+/// regardless of what the netcode had decided they pressed.
+static mut REAL_INPUTS: [Option<[bool; INPUT_KEYS_NUMBERS]>; MAX_INJECTED_PLAYERS] =
+    [None; MAX_INJECTED_PLAYERS];
+static mut REAL_INPUT_CURSOR: usize = 0;
+
+/// How many times the engine has polled for input since the queue was last
+/// filled. Only the sync test reads it: if the two runs of one frame poll a
+/// different number of times, they were not fed the same inputs, and any
+/// divergence between them says nothing about the engine.
+static mut INJECT_POLLS: usize = 0;
+
+/// What the engine's input accumulators held BEFORE this frame's input was
+/// folded in, sampled per poll: (input manager, lr, td, first button counter).
+///
+/// These are running counts of how long a direction or button has been held,
+/// and they live in the input manager rather than in the character. Moves are
+/// decided from them -- a backdash is a double tap, not a direction -- so if a
+/// savestate does not rewind them, re-simulating a frame reads a different
+/// input history than the first run did and a different move comes out. That
+/// looks exactly like engine nondeterminism and is not.
+static mut POLL_HISTORY: [(usize, i32, i32, u32); MAX_INJECTED_PLAYERS] =
+    [(0, 0, 0, 0); MAX_INJECTED_PLAYERS];
+
+/// Take the next queued input, or None once the queue for this frame is spent
+/// -- which is the signal to let the real hardware poll happen.
+unsafe fn next_injected_input() -> Option<[bool; INPUT_KEYS_NUMBERS]> {
+    INJECT_POLLS += 1;
+    let slot = REAL_INPUT_CURSOR;
+    if slot >= MAX_INJECTED_PLAYERS {
+        return None;
+    }
+    REAL_INPUT_CURSOR += 1;
+    REAL_INPUTS[slot].take()
+}
 
 static mut UPDATE: Option<Instant> = None;
 static mut TARGET: Option<u128> = None;
@@ -402,6 +507,9 @@ static mut OUTER_HALF_WIDTH: i32 = 60;
 
 static mut FREEZE_MITIGATION: bool = false;
 static mut ENABLE_CHECK_MODE: bool = false;
+// Local-play savestate sync test. See handle_sync_test. Off by default: it
+// makes the game stutter, because it rewinds a frame to check the rewind.
+static mut ENABLE_SYNC_TEST: bool = false;
 static mut WARNING_WHEN_LAGGING: bool = true;
 
 static mut MAX_ROLLBACK_PREFERENCE: u8 = 6;
@@ -685,6 +793,13 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         }
     }
 
+    if let Ok(mut path) = LOG_PATH.lock() {
+        let mut p = filename.clone();
+
+        p.push("giuroll.log");
+        *path = Some(p);
+    }
+
     let mut filepath = filename;
     filepath.push("giuroll.ini");
     //println!("{:?}", filepath);
@@ -805,6 +920,8 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         cfg!(feature = "allocconsole") || ISDEBUG,
     );
     let enable_check_mode = read_ini_bool(&conf, "Misc", "enable_check_mode", false);
+    let enable_mesh = read_ini_bool(&conf, "Netplay", "enable_mesh", true);
+    let enable_sync_test = read_ini_bool(&conf, "Misc", "enable_sync_test", false);
     let turning_off_all_extra_ui = read_ini_bool(
         &conf,
         "Misc",
@@ -954,7 +1071,12 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         OUTER_HALF_WIDTH = outer_half_width as i32;
         FREEZE_MITIGATION = freeze_mitigation;
         ENABLE_PRINTLN = enable_println;
+        mesh::ENABLED = enable_mesh;
+        if !enable_mesh {
+            println!("giuroll: mesh disabled by ini, every pair will use the relay");
+        }
         ENABLE_CHECK_MODE = enable_check_mode;
+        ENABLE_SYNC_TEST = enable_sync_test;
         WARNING_WHEN_LAGGING = warning_when_lagging;
         MAX_ROLLBACK_PREFERENCE = max_rollback_preference;
         SMOOTH_ENABLED_CONFIG = smooth_camera;
@@ -984,7 +1106,36 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         } else {
             VERSION_BYTE_60
         };
-        tamper_memory(0x858b80 as *mut u8, ver_byte);
+        // 0x858b80 is the game-id the HELLO packet carries, and giuroll
+        // stamps one byte of it so two giuroll peers can recognise each other.
+        // 4PSoku writes a full 16-byte identifier to the same place, and its
+        // relay rejects any client whose 16 bytes do not match exactly -- so
+        // whichever mod initialises last decides whether 4P netplay can connect
+        // at all. Load order is not ours to choose: ModLoaderSettings.json
+        // sorts alphabetically, which puts 4PSoku first, while SWRSToys.ini
+        // lists giuroll first.
+        //
+        // Standing aside when 4PSoku is present makes both orders end the same
+        // way. 4PSoku first: we skip, its identifier survives. Us first: it is
+        // not loaded yet so we stamp, and 4PSoku overwrites us afterwards.
+        // Either way the relay sees what it expects.
+        //
+        // The cost is that two giuroll peers cannot detect each other by this
+        // byte while 4PSoku is installed -- but that was already true whenever
+        // 4PSoku loaded second, and P_VER_BYTE below is untouched.
+        //
+        // Both branches announce themselves, because which one runs IS the load
+        // order, and load order turned out to be the difference between a
+        // working client and one that silently disables every 4P feature. When
+        // two players disagree about it, this pair of lines is what says so.
+        if !replay::four_player_mod_loaded() {
+            tamper_memory(0x858b80 as *mut u8, ver_byte);
+            println!(
+                "giuroll: loaded BEFORE 4PSoku (or without it); stamped game-id at 0x858b80"
+            );
+        } else {
+            println!("giuroll: loaded AFTER 4PSoku, leaving its game-id at 0x858b80 alone");
+        }
         tamper_memory(P_VER_BYTE, ver_byte);
     }
 
@@ -1157,6 +1308,11 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
 
         REQUESTED_THREAD_ID.store(0, Relaxed);
         NEXT_DRAW_PING = None;
+        mesh::reset();
+
+        // Re-arm the sync test, so another match re-runs it without a restart.
+        SYNC_TEST = None;
+        SYNC_TEST_FINISHED = false;
 
         *(0x8971C0 as *mut usize) = 0; // reset wether to prevent desyncs
         ESC = 0;
@@ -1427,6 +1583,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
 
         static mut CBATTLECL_PROCESS: Option<unsafe extern "thiscall" fn(usize) -> usize> = None;
         unsafe extern "thiscall" fn cbattlecl_render(cbattle: usize) -> usize {
+            trace_battle_scene();
             cbattle_process_smooth(CBATTLECL_PROCESS.unwrap(), cbattle)
         }
         CBATTLECL_PROCESS = Some(tamper_memory(
@@ -1436,6 +1593,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
 
         static mut CBATTLESV_PROCESS: Option<unsafe extern "thiscall" fn(usize) -> usize> = None;
         unsafe extern "thiscall" fn cbattlesv_render(cbattle: usize) -> usize {
+            trace_battle_scene();
             cbattle_process_smooth(CBATTLESV_PROCESS.unwrap(), cbattle)
         }
         CBATTLESV_PROCESS = Some(tamper_memory(
@@ -1724,7 +1882,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         (*a).ebp = *ptr_wrap!(((*a).esi + 0x76c) as *const u32);
         let input_manager = (*a).ecx as usize;
 
-        let real_input = match std::mem::replace(&mut REAL_INPUT, REAL_INPUT2.take()) {
+        let real_input = match next_injected_input() {
             Some(x) => x,
             None => {
                 IS_FIRST_READ_INPUTS = false;
@@ -1753,6 +1911,17 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         {
             let td = &mut *ptr_wrap!((input_manager + 0x38) as *mut i32);
             let lr = &mut *ptr_wrap!((input_manager + 0x3c) as *mut i32);
+
+            // Sample before folding this frame in. INJECT_POLLS was already
+            // incremented by next_injected_input, so it is a 1-based count.
+            if INJECT_POLLS >= 1 && INJECT_POLLS <= MAX_INJECTED_PLAYERS {
+                POLL_HISTORY[INJECT_POLLS - 1] = (
+                    input_manager,
+                    *lr,
+                    *td,
+                    *ptr_wrap!((input_manager + 0x40) as *const u32),
+                );
+            }
 
             match (real_input[0], real_input[1]) {
                 (false, true) => *lr = (*lr).max(0) + 1,
@@ -1899,6 +2068,8 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
     std::mem::forget(new);
 
     unsafe extern "cdecl" fn timing_loop(a: *mut ilhook::x86::Registers, _b: usize, _c: usize) {
+        // The one hook that still runs wherever the game is stuck.
+        trace_scene();
         //#[cfg(feature = "f62")]
         //const TARGET_FRAMETIME: i32 = 1_000_000 / 62;
         //#[cfg(not(feature = "f62"))]
@@ -2151,9 +2322,24 @@ pub extern "cdecl" fn cleanup() {
         .for_each(|x| unsafe { x.unhook() });
 }
 
-unsafe fn set_input_buffer(input: [bool; INPUT_KEYS_NUMBERS], input2: [bool; INPUT_KEYS_NUMBERS]) {
-    REAL_INPUT = Some(input);
-    REAL_INPUT2 = Some(input2);
+/// Queue one frame's inputs, in the order the engine polls them.
+unsafe fn set_input_buffers(inputs: &[[bool; INPUT_KEYS_NUMBERS]]) {
+    let opts: Vec<_> = inputs.iter().map(|i| Some(*i)).collect();
+    set_input_buffers_opt(&opts);
+}
+
+/// As set_input_buffers, for callers that legitimately have nothing to say for
+/// a given player -- replay playback past the end of one player's stream. A
+/// None slot falls through to the real hardware poll, which is the same
+/// behaviour the two-slot version had.
+unsafe fn set_input_buffers_opt(inputs: &[Option<[bool; INPUT_KEYS_NUMBERS]>]) {
+    assert!(inputs.len() <= MAX_INJECTED_PLAYERS);
+    REAL_INPUTS = [None; MAX_INJECTED_PLAYERS];
+    for (slot, i) in inputs.iter().enumerate() {
+        REAL_INPUTS[slot] = *i;
+    }
+    REAL_INPUT_CURSOR = 0;
+    INJECT_POLLS = 0;
 }
 //might not be neccesseary
 static REQUESTED_THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -2459,6 +2645,107 @@ fn update_input_time_data(buf: &[u8], packet_size: usize, is_sending: bool) {
     }
 }
 
+/// Keep a packet from reaching the game.
+///
+/// Setting eax alone is NOT enough, and that was a real bug rather than a
+/// tidiness point. eax is recvfrom's return value, so 0x400 tells the game it
+/// received a 1024-byte datagram -- and the buffer still holds our packet, with
+/// its own type byte, for the game to parse as if it were one of its own. Types
+/// 0x78 and 0x79 exist only in a 4P session, so this path is never taken in a
+/// 1v1 match: it broke exactly the configuration that was failing and left the
+/// one that worked untouched.
+///
+/// Blanking the type byte first is giuroll's own idiom for this (it does the
+/// same thing in three places for redundant game packets), and it leaves
+/// nothing for the game to dispatch on.
+unsafe fn swallow(a: *mut ilhook::x86::Registers, slic: &mut [u8]) {
+    if !slic.is_empty() {
+        slic[0] = 0;
+    }
+    (*a).eax = 0x400;
+}
+
+/// Whether the relay's character-select frames are still arriving, 4P only.
+///
+/// Character select is lockstep through the relay: a client sends its input and
+/// CANNOT advance until the relay answers with the next frame. th123 at
+/// 0x454a40 checks p1Inputs, finds it empty, and its caller at 0x4287fd just
+/// returns -- so the scene keeps rendering and stops responding to everything.
+/// Four players describe that as the game freezing.
+///
+/// When it happens the whole question is which side stopped, and until now
+/// neither end said. The relay's own log suppresses character-select input
+/// packets in both directions (they are per-frame, and printing them was once a
+/// real outage), so a frozen session and a healthy one produce the same empty
+/// log. This is the other half of that answer: if these lines keep coming while
+/// players report a freeze, the relay is still feeding us and the fault is on
+/// this side; if they stop, it is not.
+///
+/// Gated on 4PSoku being loaded and on actually being in a select scene, so a
+/// 1v1 match never prints any of it.
+static mut CHRSELECT_LAST_RX: Option<Instant> = None;
+static mut CHRSELECT_LAST_REPORT: Option<Instant> = None;
+static mut CHRSELECT_FRAME: u32 = 0;
+static mut CHRSELECT_INPUTS: u8 = 0;
+static mut CHRSELECT_RECEIVED: u32 = 0;
+static mut CHRSELECT_SILENT: bool = false;
+
+unsafe fn chrselect_trace(arrived: Option<(u32, u8)>) {
+    // 8..11 are the netplay select scenes; giuroll reads the same address for
+    // the same purpose in its freeze mitigation.
+    if !matches!(*(0x008A0044 as *const usize), 8 | 9 | 10 | 11) {
+        CHRSELECT_LAST_RX = None;
+        CHRSELECT_SILENT = false;
+        return;
+    }
+
+    let now = Instant::now();
+
+    if let Some((frame, inputs)) = arrived {
+        CHRSELECT_LAST_RX = Some(now);
+        CHRSELECT_FRAME = frame;
+        CHRSELECT_INPUTS = inputs;
+        CHRSELECT_RECEIVED += 1;
+        if CHRSELECT_SILENT {
+            CHRSELECT_SILENT = false;
+            println!(
+                "giuroll 4P: character-select frames are arriving again (frame {})",
+                frame
+            );
+        }
+    }
+
+    let Some(last) = CHRSELECT_LAST_RX else {
+        return;
+    };
+    let quiet = now.duration_since(last);
+
+    if !CHRSELECT_SILENT && quiet > std::time::Duration::from_millis(1000) {
+        CHRSELECT_SILENT = true;
+        println!(
+            "giuroll 4P: no character-select frame from the relay for {} ms -- the last was              frame {} carrying {} inputs. The game cannot advance without one, so this is              the freeze, and it is upstream of us.",
+            quiet.as_millis(),
+            CHRSELECT_FRAME,
+            CHRSELECT_INPUTS
+        );
+        return;
+    }
+
+    if CHRSELECT_SILENT {
+        return;
+    }
+    if CHRSELECT_LAST_REPORT
+        .map_or(false, |t| now.duration_since(t) < std::time::Duration::from_secs(2))
+    {
+        return;
+    }
+    CHRSELECT_LAST_REPORT = Some(now);
+    println!(
+        "giuroll 4P: character select at frame {} ({} frames received, {} inputs in the last)",
+        CHRSELECT_FRAME, CHRSELECT_RECEIVED, CHRSELECT_INPUTS
+    );
+}
+
 unsafe extern "cdecl" fn readonlinedata(a: *mut ilhook::x86::Registers, _b: usize) {
     const P1_PACKETS: [u8; 400] = [
         13, 3, 1, 0, 0, 0, 5, 2, 0, 0, 0, 0, 12, 0, 103, 0, 103, 0, 103, 0, 103, 0, 104, 0, 104, 0,
@@ -2495,6 +2782,32 @@ unsafe extern "cdecl" fn readonlinedata(a: *mut ilhook::x86::Registers, _b: usiz
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
 
+    /// One 4P frame's worth of the canned packet above, when 4PSoku is loaded.
+    ///
+    /// P1_PACKETS and P2_PACKETS are stock 1v1: they declare 2 and 1 inputs,
+    /// which is one frame and half a frame to a receiver that takes them two at
+    /// a time. 4PSoku's receiver takes them FOUR at a time -- it patches the
+    /// distribute loop to stride 4 and gates it on `frames * 4 <= queue.len()`
+    /// -- so a 2-input packet yields ZERO frames and pushes nothing, while the
+    /// far end of that queue pops once per frame regardless. Left alone, these
+    /// packets starve the very queue they exist to keep fed.
+    ///
+    /// Widening the declared count to exactly one 4P frame keeps the pushes and
+    /// the pops in step. The contents stay neutral, which is what they already
+    /// were: this packet is a placeholder to stop the game's netplay path
+    /// stalling, not a carrier of real input. giuroll supplies the real inputs.
+    ///
+    /// Layout: [0] packet type, [1] event type, [2..6] frame id, [6] scene id,
+    /// [7] input count, [8..] that many 2-byte inputs.
+    fn canned(stock: &[u8; 400]) -> [u8; 400] {
+        let mut p = *stock;
+        if replay::four_player_mod_loaded() {
+            p[7] = 4;
+            p[8..16].fill(0);
+        }
+        p
+    }
+
     //both packets here are the same, both are the 0th packet, this is maybe unneccesseary
 
     let esp = (*a).esp;
@@ -2528,9 +2841,9 @@ unsafe extern "cdecl" fn readonlinedata(a: *mut ilhook::x86::Registers, _b: usiz
             ESC2.store(1, Relaxed);
 
             if !is_p1() {
-                slic.copy_from_slice(&P1_PACKETS)
+                slic.copy_from_slice(&canned(&P1_PACKETS))
             } else {
-                slic.copy_from_slice(&P2_PACKETS)
+                slic.copy_from_slice(&canned(&P2_PACKETS))
             }
         }
     } else if type1 == 0x6c {
@@ -2547,8 +2860,43 @@ unsafe extern "cdecl" fn readonlinedata(a: *mut ilhook::x86::Registers, _b: usiz
         );
 
         (*a).eax = 0x400;
+    } else if type1 == mesh::PACKET_PEER_LIST {
+        // Where everyone is, from the relay.
+        mesh::handle_peer_list(&slic[0..(len.max(0) as usize).min(400)]);
+        swallow(a, slic);
+    } else if type1 == mesh::PACKET_PUNCH {
+        // A peer's hole-punch probe. The address it arrived FROM is the one
+        // worth keeping -- see mesh::PeerLink::confirmed.
+        mesh::handle_punch(
+            &slic[0..(len.max(0) as usize).min(400)],
+            ((*a).esp + 0x44) as *const windows::Win32::Networking::WinSock::SOCKADDR,
+        );
+        swallow(a, slic);
     } else if type1 > 0x6c && type1 <= 0x80 {
-        (*a).eax = 0x400;
+        swallow(a, slic);
+    }
+
+    // Driven from here rather than from the frame hook because punching has to
+    // finish during character select, before there is a battle to hook into.
+    // Relay traffic keeps this called often; the probes are rate-limited inside.
+    mesh::tick_punching();
+
+    // Called on EVERY pass, not only when a character-select frame arrives:
+    // this hook sits on the recvfrom itself, so it still runs on the failing
+    // read that ends the game's drain loop. That is what lets silence be
+    // noticed at all -- a tracer fed only by arrivals goes quiet exactly when
+    // it has something to say.
+    if replay::four_player_mod_loaded() {
+        let frame = if type1 == 13 && type2 == 3 && sceneid == 3 && len >= 8 {
+            Some((
+                u32::from_le_bytes(slic[2..6].try_into().unwrap()),
+                slic[7],
+            ))
+        } else {
+            None
+        };
+
+        chrselect_trace(frame);
     }
 
     if type1 == 0x6b {
@@ -2572,9 +2920,9 @@ unsafe extern "cdecl" fn readonlinedata(a: *mut ilhook::x86::Registers, _b: usiz
             };
             //the packet you receive first frame, every round. We are making it manually, to prevent data loss from freezing the game
             if !is_p1 {
-                slic.copy_from_slice(&P1_PACKETS)
+                slic.copy_from_slice(&canned(&P1_PACKETS))
             } else {
-                slic.copy_from_slice(&P2_PACKETS)
+                slic.copy_from_slice(&canned(&P2_PACKETS))
             }
         } else {
             (*a).eax = 0x400;
@@ -2673,9 +3021,9 @@ unsafe extern "cdecl" fn readonlinedata(a: *mut ilhook::x86::Registers, _b: usiz
                 };
                 //the packet you receive first frame, every round. We are making it manually, to prevent data loss from freezing the game
                 if !is_p1 {
-                    slic.copy_from_slice(&P1_PACKETS)
+                    slic.copy_from_slice(&canned(&P1_PACKETS))
                 } else {
-                    slic.copy_from_slice(&P2_PACKETS)
+                    slic.copy_from_slice(&canned(&P2_PACKETS))
                 }
             }
 
@@ -2922,6 +3270,579 @@ unsafe fn update_toggle_stat_from_keys() {
     LAST_TOGGLE = stat_toggle;
 }
 
+// --- local-play sync test ---------------------------------------------------
+//
+// Answers the three questions rollback stands on, in local versus, with no
+// second machine and no network:
+//
+//   RESTORE   does a savestate put back exactly what it saved, P3/P4 included,
+//             and does it still do so the SECOND time it is restored?
+//   REPLAY    does re-simulating a frame from that savestate with the same
+//             inputs produce the same result?
+//   ROLLBACK  after simulating a frame with the WRONG inputs and rolling it
+//             back, does re-simulating with the right ones land exactly where
+//             simulating them directly would have?
+//
+// The third is the one that matters and the one that is hardest to get right.
+// Rollback mispredicts constantly -- that is its whole design -- so a frame
+// simulated from bad inputs must leave nothing behind: no stray object, no heap
+// churn, no counter nudged one further along. Residue from a discarded
+// simulation is the classic rollback bug, it is invisible until it desyncs two
+// players who each rolled back differently, and no amount of reading finds it.
+//
+// WHY IT LIVES HERE. giuroll does nothing at all in local versus: main_hook
+// sends replay to handle_replay, netplay to handle_online, and everything else
+// to `_ => ()`. No savestate machinery runs, so there is nothing to piggyback
+// on. Replays would have been the cheaper driver, but with 4PSoku loaded the
+// engine's replay playback feeds inputs to NOBODY (measured 2026-09-03: P1..P4
+// all read 0000 at matchState==2, while recording the same match read 0085),
+// so that route is closed.
+//
+// THE CYCLE, four engine ticks per game frame. One savestate, restored twice --
+// Frame::restore takes &self, which is what makes this possible at all:
+//
+//   Idle     snapshot, dump a Frame, inject the RIGHT inputs.
+//            The engine simulates frame N. This is the reference.
+//   First    snapshot the reference. Restore, and check the restore landed on
+//            the Idle snapshot. Inject WRONG inputs, deliberately decorrelated
+//            from the right ones. The engine simulates frame N mispredicted.
+//   Second   restore a second time from the same Frame, and check THAT landed
+//            on the Idle snapshot too. Inject the RIGHT inputs again. The
+//            engine simulates frame N properly.
+//   Third    snapshot. It must equal the reference: the mispredicted
+//            simulation must have left no trace.
+//
+// A rollback test where the misprediction happened not to matter proves
+// nothing, so the run also counts how often the mispredicted state actually
+// differed from the reference. If that number is low the test is mostly
+// measuring nothing, whatever its pass rate says.
+//
+// Inputs are synthetic, hashed from the frame number and held for six frames at
+// a time so that moves and projectiles actually come out. Projectiles are the
+// point: they drive the per-frame heap traffic a savestate has to get right,
+// and a test that only walked back and forth would never touch it. Both sets
+// are stored rather than regenerated, so a later run cannot differ from an
+// earlier one by way of the generator.
+//
+// The four inputs feed the four polls of 0x46c900 in order. Verified 2026-09-03
+// to be P1, P2, P3, P4, by matching the KeymapManager each poll was handed
+// against the one each player names through CharacterManager+0x750 -- and the
+// run still prints that mapping, because the assist players' managers live
+// inside 4PSoku.dll at an address that moves between launches.
+//
+// The game plays itself, at a quarter speed, while this runs. Both are
+// expected: this is a diagnostic mode, not a playable one.
+static mut SYNC_TEST: Option<SyncTest> = None;
+
+/// Set once the bounded run is over, so the heap hooks stop being re-armed.
+static mut SYNC_TEST_FINISHED: bool = false;
+
+type Inputs = Vec<[bool; INPUT_KEYS_NUMBERS]>;
+
+/// How many frames each of the three runs simulates.
+///
+/// One frame was not enough to mean anything: a character mid-move, in hitstun
+/// or landing ignores input entirely, so a single wrong frame changed nothing
+/// in 85% of cycles and the test was rolling back frames that were already
+/// identical. Real rollback mispredicts several frames deep -- the budget here
+/// is capped at 15 -- and divergence compounds over them, so simulating a
+/// stretch is both the more faithful test and the one that actually exercises
+/// the thing.
+const RUN_FRAMES: usize = 4;
+
+enum SyncPhase {
+    Idle,
+    /// One of the three runs of the same RUN_FRAMES-long stretch is in flight.
+    Running {
+        kind: RunKind,
+        /// Frames of this run already injected.
+        done: usize,
+        /// The savestate all three runs start from. Restored twice.
+        frame: rollback::Frame,
+        /// State at the moment it was saved, to check both restores against.
+        before: replay::CheckData,
+        base_fc: usize,
+        /// Filled in as each run finishes.
+        reference: Option<replay::CheckData>,
+        mispredicted: Option<replay::CheckData>,
+        polls_ref: usize,
+        hist_ref: [(usize, i32, i32, u32); MAX_INJECTED_PLAYERS],
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    /// Right inputs, from the savestate. What the frames actually were.
+    Reference,
+    /// Wrong inputs, from the same savestate. What a peer guessed.
+    Mispredicted,
+    /// Right inputs again, after rolling the misprediction back.
+    Corrected,
+}
+
+struct SyncTest {
+    phase: SyncPhase,
+    checked: usize,
+    restore_failed: usize,
+    rollback_failed: usize,
+    /// Cycles where feeding the wrong inputs actually changed the frame. A
+    /// rollback test whose mispredictions never mattered proves nothing, so
+    /// this is the run's own coverage measure, not a curiosity.
+    misprediction_mattered: usize,
+    assists_seen: bool,
+    warned_no_assists: bool,
+    /// Cycles where restore did not put the frame counter back.
+    fc_not_rewound: usize,
+    /// Cycles where two runs of a frame polled input a different number of times.
+    poll_mismatch: usize,
+    /// Cycles where two runs of a frame read a different input history.
+    history_mismatch: usize,
+    mapping_reported: bool,
+    /// How often each field failed, by name, tagged with which check caught it.
+    field_hits: std::collections::BTreeMap<String, usize>,
+}
+
+/// A deterministic input for one player on one frame.
+///
+/// Held for six frames at a time. Fresh randomness every frame reads as mashing
+/// and mostly produces neutral -- almost nothing in this game comes out in one
+/// frame -- so the test would exercise far less of the engine than it appears
+/// to.
+fn synth_input(frame: usize, player: usize) -> [bool; INPUT_KEYS_NUMBERS] {
+    let mut h = ((frame / 6) as u64)
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(player as u64 + 1);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+    h ^= h >> 27;
+
+    let mut out = [false; INPUT_KEYS_NUMBERS];
+    // 0..4 are the two axes. Kept exclusive per axis so the result looks like a
+    // stick position rather than an impossible left+right.
+    match h & 3 {
+        1 => out[0] = true,
+        2 => out[1] = true,
+        _ => (),
+    }
+    match (h >> 2) & 3 {
+        1 => out[2] = true,
+        2 => out[3] = true,
+        _ => (),
+    }
+    // 4..10 are the six battle buttons -- a, b, c, d, changeCard, spellcard --
+    // which is exactly SokuLib's KeyInputLight. 10 and 11 are pause and select,
+    // and synthesising those opens the pause menu: the game stops advancing and
+    // the test reports nothing rather than failing, which is the worst way for
+    // a diagnostic to break. Roughly one group of frames in four holds a given
+    // button.
+    const PAST_LAST_BATTLE_BUTTON: usize = 10;
+    for (i, o) in out
+        .iter_mut()
+        .enumerate()
+        .take(PAST_LAST_BATTLE_BUTTON)
+        .skip(4)
+    {
+        *o = (h >> (i * 3)) & 3 == 0;
+    }
+    out
+}
+
+/// The inputs a mispredicting peer would have guessed. Decorrelated from the
+/// right ones rather than neutral, because neutral often IS what the player was
+/// doing, and a misprediction that happens to be correct exercises nothing.
+fn wrong_input(frame: usize, player: usize) -> [bool; INPUT_KEYS_NUMBERS] {
+    synth_input(frame.wrapping_add(9973), player)
+}
+
+unsafe fn handle_sync_test(battle_state: &u32, cur_speed_iter: u32) {
+    // Only on the first pass of a render tick, and only in a live battle.
+    // matchState 2 is the fighting phase; snapshots taken during the round
+    // intro compare equal for uninteresting reasons.
+    if cur_speed_iter != 0 || *battle_state != 2 {
+        return;
+    }
+
+    // Bounded run, then disarm.
+    //
+    // Each cycle throws away two simulations without calling never_happened()
+    // on them, so whatever those frames allocated leaks. Doing the bookkeeping
+    // properly means reproducing what Rollbacker does with dropped frames, and
+    // getting it wrong corrupts the heap rather than failing loudly -- not what
+    // you want in the tool that is supposed to be the trustworthy one. A couple
+    // hundred frames of leaked allocations is nothing; an unbounded run is a
+    // slow death.
+    const MAX_CHECKS: usize = 100;
+
+    if let Some(st) = SYNC_TEST.as_ref() {
+        if st.checked >= MAX_CHECKS {
+            return;
+        }
+    }
+
+    if SYNC_TEST.is_none() {
+        SYNC_TEST = Some(SyncTest {
+            phase: SyncPhase::Idle,
+            checked: 0,
+            restore_failed: 0,
+            rollback_failed: 0,
+            misprediction_mattered: 0,
+            assists_seen: false,
+            warned_no_assists: false,
+            fc_not_rewound: 0,
+            poll_mismatch: 0,
+            history_mismatch: 0,
+            mapping_reported: false,
+            field_hits: std::collections::BTreeMap::new(),
+        });
+        // Our own console, and printing forced on. giuroll's println! is gated
+        // behind enable_println AND needs a console to exist -- check mode
+        // allocates one for exactly this reason. A diagnostic whose output goes
+        // nowhere is worse than none: silence would read as success.
+        let _ = windows::Win32::System::Console::AllocConsole();
+        ENABLE_PRINTLN = true;
+        println!("giuroll: sync test armed (local versus, matchState 2)");
+    }
+
+    let st = SYNC_TEST.as_mut().unwrap();
+
+    // Heap traffic is deliberately NOT drained here. dump_frame and restore
+    // each drain MEMORY_RECEIVER_ALLOC/FREE themselves, which is how the
+    // netplay path gets its accounting. Draining first and passing the sets
+    // back as the "extra" arguments looks equivalent and is not: dump_frame
+    // collects the extras into two locals it then never reads
+    // (rollback.rs:830-833), so anything taken out of the channels here is
+    // simply dropped on the floor.
+
+    match std::mem::replace(&mut st.phase, SyncPhase::Idle) {
+        SyncPhase::Idle => {
+            let before = replay::CheckData::from_battle();
+
+            if before.has_assists() {
+                st.assists_seen = true;
+            } else if !st.warned_no_assists {
+                st.warned_no_assists = true;
+                println!(
+                    "giuroll: sync test sees only 2 players -- either 4PSoku is \
+                     not loaded or this is a 1v1. Results say NOTHING about 2v2."
+                );
+            }
+
+            let base_fc = *SOKU_FRAMECOUNT;
+            let frame = rollback::dump_frame(
+                None::<std::iter::Empty<usize>>,
+                None::<std::iter::Empty<usize>>,
+            );
+
+            inject_for(&before, RunKind::Reference, base_fc);
+            st.phase = SyncPhase::Running {
+                kind: RunKind::Reference,
+                done: 1,
+                frame,
+                before,
+                base_fc,
+                reference: None,
+                mispredicted: None,
+                polls_ref: 0,
+                hist_ref: [(0, 0, 0, 0); MAX_INJECTED_PLAYERS],
+            };
+        }
+
+        SyncPhase::Running {
+            kind,
+            done,
+            frame,
+            before,
+            base_fc,
+            reference,
+            mispredicted,
+            polls_ref,
+            hist_ref,
+        } => {
+            // Still mid-run: feed the next frame of this run and wait.
+            if done < RUN_FRAMES {
+                inject_for(&before, kind, base_fc + done);
+                st.phase = SyncPhase::Running {
+                    kind,
+                    done: done + 1,
+                    frame,
+                    before,
+                    base_fc,
+                    reference,
+                    mispredicted,
+                    polls_ref,
+                    hist_ref,
+                };
+                return;
+            }
+
+            // The run just finished; this tick sees its end state.
+            let ended = replay::CheckData::from_battle();
+
+            match kind {
+                RunKind::Reference => {
+                    let polls_ref = INJECT_POLLS;
+                    let hist_ref = POLL_HISTORY;
+                    report_mapping_once(st, polls_ref, &hist_ref);
+
+                    restore_to(&frame);
+                    check_restore(st, &before, "restore 1", base_fc);
+
+                    inject_for(&before, RunKind::Mispredicted, base_fc);
+                    st.phase = SyncPhase::Running {
+                        kind: RunKind::Mispredicted,
+                        done: 1,
+                        frame,
+                        before,
+                        base_fc,
+                        reference: Some(ended),
+                        mispredicted: None,
+                        polls_ref,
+                        hist_ref,
+                    };
+                }
+
+                RunKind::Mispredicted => {
+                    // Second restore from the SAME savestate. If a Frame could
+                    // only be restored once, real rollback would break the
+                    // moment two corrections landed on one frame.
+                    restore_to(&frame);
+                    check_restore(st, &before, "restore 2", base_fc);
+
+                    inject_for(&before, RunKind::Corrected, base_fc);
+                    st.phase = SyncPhase::Running {
+                        kind: RunKind::Corrected,
+                        done: 1,
+                        frame,
+                        before,
+                        base_fc,
+                        reference,
+                        mispredicted: Some(ended),
+                        polls_ref,
+                        hist_ref,
+                    };
+                }
+
+                RunKind::Corrected => {
+                    let corrected = ended;
+                    let reference = reference.unwrap();
+                    let mispredicted = mispredicted.unwrap();
+
+                    let mut f = frame;
+                    f.did_happen();
+
+                    st.checked += 1;
+                    if mispredicted != reference {
+                        st.misprediction_mattered += 1;
+                    }
+                    if INJECT_POLLS != polls_ref {
+                        st.poll_mismatch += 1;
+                    }
+                    if POLL_HISTORY != hist_ref {
+                        st.history_mismatch += 1;
+                    }
+
+                    if corrected != reference {
+                        st.rollback_failed += 1;
+                        for f in reference.diff_fields(&corrected) {
+                            *st.field_hits.entry(format!("rollback {}", f)).or_insert(0) += 1;
+                        }
+                        // Full dumps for the first few only. A hundred of them
+                        // scroll the summary off the top of the console, and
+                        // the summary is the part that answers the question.
+                        if st.rollback_failed <= 3 {
+                            println!(
+                                "giuroll SYNC TEST rollback FAILED\n  \
+                                 frames {}..{} (now {})\n  \
+                                 polls: ref {} corrected {}\n  \
+                                 reference:    {:?}\n  \
+                                 mispredicted: {:?}\n  \
+                                 corrected:    {:?}",
+                                base_fc,
+                                base_fc + RUN_FRAMES,
+                                *SOKU_FRAMECOUNT,
+                                polls_ref,
+                                INJECT_POLLS,
+                                reference,
+                                mispredicted,
+                                corrected
+                            );
+                        }
+                    } else if st.checked % 25 == 0 {
+                        println!(
+                            "giuroll: sync test {} checks, restore {} / rollback {} failures, \
+                             mispredictions that mattered {}, assists={}",
+                            st.checked,
+                            st.restore_failed,
+                            st.rollback_failed,
+                            st.misprediction_mattered,
+                            st.assists_seen
+                        );
+                    }
+
+                    if st.checked >= MAX_CHECKS {
+                        report_and_disarm(st);
+                    }
+
+                    st.phase = SyncPhase::Idle;
+                }
+            }
+        }
+    }
+}
+
+/// Queue one frame's inputs for whichever run is in flight.
+///
+/// `at` is the game frame being simulated, not the frame the run started from,
+/// so a run of several frames gets a changing input rather than one held value.
+unsafe fn inject_for(before: &replay::CheckData, kind: RunKind, at: usize) {
+    let n = if before.has_assists() { 4 } else { 2 };
+    let inputs: Inputs = (0..n)
+        .map(|p| match kind {
+            RunKind::Mispredicted => wrong_input(at, p),
+            _ => synth_input(at, p),
+        })
+        .collect();
+    set_input_buffers(&inputs);
+}
+
+unsafe fn restore_to(frame: &rollback::Frame) {
+    frame.restore(
+        None::<std::iter::Empty<&mut rollback::Frame>>,
+        None::<std::iter::Empty<usize>>,
+        None::<std::iter::Empty<usize>>,
+    );
+}
+
+/// Which poll drives which player -- read, not assumed.
+///
+/// Everything downstream of here routes a peer's inputs to a slot, so a wrong
+/// mapping puts people in control of the wrong character. No experiment is
+/// needed: each poll records the KeymapManager it was handed, and each player
+/// names its own through CharacterManager+0x750 -> KeyManager -> KeymapManager.
+/// Matching the two is exact.
+unsafe fn report_mapping_once(
+    st: &mut SyncTest,
+    polls: usize,
+    hist: &[(usize, i32, i32, u32); MAX_INJECTED_PLAYERS],
+) {
+    if st.mapping_reported {
+        return;
+    }
+    st.mapping_reported = true;
+
+    let plausible = |a: usize| (0x00400000..0x7fff0000).contains(&a);
+    let bm = *(0x008985E4 as *const usize);
+    println!("giuroll: input poll order ->");
+    for (k, sample) in hist.iter().enumerate().take(polls) {
+        let mgr = sample.0;
+        let mut who = "UNMATCHED".to_string();
+        for n in 0..4usize {
+            let player = *ptr_wrap!((bm + 0xc + n * 4) as *const usize);
+            if !plausible(player) {
+                continue;
+            }
+            let km = *ptr_wrap!((player + 0x750) as *const usize);
+            if !plausible(km) {
+                continue;
+            }
+            if *ptr_wrap!(km as *const usize) == mgr {
+                who = format!("P{}", n + 1);
+            }
+        }
+        println!("  poll {} -> manager {:#010x} -> {}", k, mgr, who);
+    }
+}
+
+/// Compare the state just restored against the state that was saved.
+unsafe fn check_restore(
+    st: &mut SyncTest,
+    before: &replay::CheckData,
+    which: &str,
+    fc_idle: usize,
+) {
+    if *SOKU_FRAMECOUNT != fc_idle {
+        st.fc_not_rewound += 1;
+    }
+
+    let restored = replay::CheckData::from_battle();
+    if restored != *before {
+        st.restore_failed += 1;
+        for f in before.diff_fields(&restored) {
+            *st.field_hits.entry(format!("{} {}", which, f)).or_insert(0) += 1;
+        }
+        if st.restore_failed <= 3 {
+            println!(
+                "giuroll SYNC TEST {} FAILED at frame {}\n  saved:    {:?}\n  restored: {:?}",
+                which, fc_idle, before, restored
+            );
+        }
+    }
+}
+
+unsafe fn report_and_disarm(st: &mut SyncTest) {
+    println!(
+        "\n=== giuroll sync test DONE: {} checks, assists seen = {} ===\n\
+         restore  failures: {}\n\
+         rollback failures: {}\n\
+         mispredictions that actually changed the frame: {} of {}\n\
+         frame counter not rewound by restore: {}\n\
+         runs that polled input a different number of times: {}\n\
+         runs that read a different input history: {}",
+        st.checked,
+        st.assists_seen,
+        st.restore_failed,
+        st.rollback_failed,
+        st.misprediction_mattered,
+        st.checked,
+        st.fc_not_rewound,
+        st.poll_mismatch,
+        st.history_mismatch
+    );
+
+    let mut hits: Vec<(&String, &usize)> = st.field_hits.iter().collect();
+    hits.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (name, n) in &hits {
+        println!("  {:<30} {:>4} / {} checks", name, n, st.checked);
+    }
+
+    // Coverage first. A pass whose mispredictions never mattered is not a pass,
+    // it is a test that did not run, and reporting it as success is how a
+    // diagnostic starts lying.
+    let thin = st.misprediction_mattered * 4 < st.checked;
+
+    println!(
+        "{}",
+        if !st.assists_seen {
+            "Only two players were ever present -- says nothing about 2v2."
+        } else if st.restore_failed > 0 {
+            "Restore is losing state. Fix that before reading anything else -- \n\
+             a rollback check that starts from the wrong state measures nothing."
+        } else if st.rollback_failed > 0 {
+            "Mispredicted frames are leaving residue: rolling back and \n\
+             re-simulating with the right inputs does NOT land where simulating \n\
+             them directly does. See the tally for which fields survive the \n\
+             rollback they should not have."
+        } else if thin {
+            "PASSED, but most mispredictions changed nothing, so little was \n\
+             actually rolled back. Treat this as weak evidence."
+        } else {
+            "Savestate restores all four players exactly, twice from one state; \n\
+             re-simulation is deterministic; and a frame simulated from wrong \n\
+             inputs leaves no trace once rolled back. That is rollback's whole \n\
+             contract, for four players."
+        }
+    );
+
+    // Disarm, and commit the frees the hooks held back. This is what on_exit
+    // does at the end of a match; leaving the thread id set would queue every
+    // free for the rest of the round and execute none of them.
+    SYNC_TEST_FINISHED = true;
+    REQUESTED_THREAD_ID.store(0, Relaxed);
+    for a in MEMORY_RECEIVER_FREE.as_ref().unwrap().try_iter() {
+        soku_heap_free!(a);
+    }
+}
+
 unsafe fn handle_online(
     framecount: usize,
     battle_state: &mut u32,
@@ -2938,10 +3859,41 @@ unsafe fn handle_online(
         SOUND_MANAGER = Some(RollbackSoundManager::new());
         let m = DATA_RECEIVER.take().unwrap();
 
-        let rollbacker = Rollbacker::new();
+        // Who is playing, and which of them are we.
+        //
+        // Slots are the engine's input-poll order: P1, P2, P3, P4. For a 1v1
+        // the host is P1 and the client P2, which is what the netmanager
+        // vtable check has always meant.
+        //
+        // The 2v2 case still reports two players here on purpose. Everything
+        // below this line is now slot-indexed and ready for four, but nothing
+        // yet TELLS us which of the four seats we occupy -- that comes from
+        // 4PSoku's server, which still runs its lockstep barrier. Claiming four
+        // players before that arrives would route three peers' inputs into
+        // slots chosen by guesswork, which is worse than running as two.
+        // Who is playing, and which seat are we in.
+        //
+        // In a 4P session 4PSoku's server has already assigned and acked a
+        // slot, so it is asked. Everywhere else there are two players and the
+        // host is P1, which is what the netmanager vtable check has always
+        // meant.
+        let (players, local_slot) = match replay::four_player_local_slot() {
+            Some(slot) => (4, slot),
+            None => (2, if is_p1() { 0 } else { 1 }),
+        };
+        println!("giuroll: {} players, we are slot {}", players, local_slot);
+        if players > 2 {
+            mesh::LOCAL_SLOT = Some(local_slot);
+            println!(
+                "giuroll: {} of {} peers on a direct path",
+                mesh::direct_count(),
+                players - 1
+            );
+        }
+        let rollbacker = Rollbacker::new(players, local_slot);
 
         ROLLBACKER = Some(rollbacker);
-        let mut netcoder = Netcoder::new(m, MAX_ROLLBACK_PREFERENCE);
+        let mut netcoder = Netcoder::new(m, MAX_ROLLBACK_PREFERENCE, players);
         if round == 1 {
             netcoder.autodelay_enabled = if AUTODELAY_ENABLED {
                 Some(AUTODELAY_ROLLBACK)
@@ -3018,6 +3970,196 @@ unsafe fn handle_online(
     }
 }
 
+/// Which scene the game is in, and whether the loading worker has finished.
+///
+/// Driven from the frame limiter, which is the only hook that keeps running no
+/// matter where the game is stuck. Everything else giuroll installs lives
+/// inside a scene that may never start, and reports nothing when it does not.
+///
+/// 0x8a0040 is the LIVE scene id; 0x8a0044 is the previous one, which is what
+/// giuroll's freeze mitigation reads and is not what we want here. 0x89868c is
+/// the loading worker's job number: the thread at 0x43e5e0 switches on it, runs
+/// one of five steps, then zeroes it. Step 5 tail-jumps into CBattleManager's
+/// loader.
+///
+/// The netplay loading scene, CLoadingCL at 0x4286d0, is nothing but a poll of
+/// that flag -- it returns BATTLECL when the flag is clear and stays put when
+/// it is not. So a worker that never finishes is a black screen with no other
+/// symptom anywhere: the relay's state machine has already reached FIGHT and is
+/// satisfied, and every giuroll hook is downstream of a battle scene that never
+/// starts.
+static mut LAST_SCENE_STATE: Option<(u32, u32)> = None;
+static mut LAST_SCENE_REPORT: Option<Instant> = None;
+
+fn scene_name(scene: u32) -> &'static str {
+    match scene {
+        0 => "LOGO",
+        1 => "OPENING",
+        2 => "TITLE",
+        3 => "SELECT",
+        5 => "BATTLE",
+        6 => "LOADING",
+        8 => "SELECTSV",
+        9 => "SELECTCL",
+        10 => "LOADINGSV",
+        11 => "LOADINGCL",
+        12 => "LOADINGWATCH",
+        13 => "BATTLESV",
+        14 => "BATTLECL",
+        15 => "BATTLEWATCH",
+        16 => "SELECTSCENARIO",
+        20 => "ENDING",
+        _ => "?",
+    }
+}
+
+unsafe fn trace_scene() {
+    if !replay::four_player_mod_loaded() {
+        return;
+    }
+    let scene = *(0x8a0040 as *const u32);
+    let loading = *(0x89868c as *const u32);
+    let state = (scene, loading);
+    let now = Instant::now();
+
+    if LAST_SCENE_STATE == Some(state)
+        && LAST_SCENE_REPORT.map_or(false, |t| {
+            now.duration_since(t) < std::time::Duration::from_secs(2)
+        })
+    {
+        return;
+    }
+    LAST_SCENE_STATE = Some(state);
+    LAST_SCENE_REPORT = Some(now);
+
+    println!(
+        "giuroll 4P: scene {} ({}), loading worker step {} ({}), battle manager {}",
+        scene,
+        scene_name(scene),
+        loading,
+        if loading == 0 {
+            "idle"
+        } else {
+            "STILL RUNNING -- the scene will not advance until it clears"
+        },
+        if BATTLE_MANAGER_RAN {
+            "has run"
+        } else {
+            "has NEVER run"
+        }
+    );
+}
+
+/// Why the battle scene is not running the battle, 4P only.
+///
+/// CBattleCL::onProcess (0x4285c0) has exactly two guards between entry and the
+/// call to CBattleManager::onProcess, and giuroll's own hooks all sit AFTER
+/// them -- the netplay bypass at 0x428600 and the frame hook at 0x482701 are
+/// both downstream. So when either guard holds, giuroll is not merely idle, it
+/// is unreachable, and every trace it has says nothing because none of them
+/// run. A four-player session that loads into a black screen with a silent
+/// giuroll log looks exactly like that.
+///
+/// The two guards:
+///
+///   0x4285e0  call 0x43e740      -- returns 1 while an async loader task is
+///                                   still queued: it is `dword[0x89a88c] !=
+///                                   byte[0x89a456]`, a queue write index
+///                                   against a read index over the list at
+///                                   0x89a888. Note the type mismatch, which is
+///                                   the game's, not a typo: 0x444621 reads the
+///                                   same location as a BYTE. Anything leaving
+///                                   junk in 0x89a88d..f makes this true for
+///                                   ever, so the raw dword is printed.
+///   0x4285f3  cmp [mgr+0x88], 6  -- the battle phase, the same field
+///                                   main_hook calls battle_state.
+///
+/// Printed from the scene's own vtable wrapper, which giuroll already installs
+/// and which runs every tick regardless of either guard.
+static mut BATTLE_SCENE_REPORT: Option<Instant> = None;
+static mut BATTLE_MANAGER_RAN: bool = false;
+
+unsafe fn trace_battle_scene() {
+    if !replay::four_player_mod_loaded() {
+        return;
+    }
+    let now = Instant::now();
+    if BATTLE_SCENE_REPORT
+        .map_or(false, |t| now.duration_since(t) < std::time::Duration::from_secs(2))
+    {
+        return;
+    }
+    BATTLE_SCENE_REPORT = Some(now);
+
+    let read_index = *(0x89a456 as *const u8);
+    let write_index = *(0x89a88c as *const u32);
+    let manager = *(0x8985e4 as *const usize);
+    let phase = if manager != 0 {
+        *((manager + 0x88) as *const u32) as i64
+    } else {
+        -1
+    };
+
+    let blocked = if write_index != read_index as u32 {
+        "LOADER QUEUE NOT DRAINED -- the scene refuses to run the battle"
+    } else if phase == 6 {
+        "PHASE 6 -- the scene refuses to run the battle"
+    } else {
+        "guards clear"
+    };
+
+    println!(
+        "giuroll 4P: battle scene -- {}; loader write=0x{:08x} read={}, phase={},          battle manager {}",
+        blocked,
+        write_index,
+        read_index,
+        phase,
+        if BATTLE_MANAGER_RAN {
+            "has run"
+        } else {
+            "has NEVER run"
+        }
+    );
+}
+
+/// Which arm of the frame dispatch was taken, 4P only, once per change.
+///
+/// giuroll's entire netplay path hangs off one match on (sub mode, is netplay),
+/// and when that match falls through nothing says so: giuroll simply does
+/// nothing for the rest of the battle. In a 1v1 that is harmless -- the game's
+/// own netcode is perfectly capable. In a 2v2 it is fatal and silent, because
+/// the relay reflects each client's own datagram instead of combining four
+/// players' inputs the way a Soku host does, so the game's netcode has nothing
+/// it can use. The battle loads, never draws a frame, and no component reports
+/// anything: the relay's state machine reached FIGHT and is satisfied, and
+/// giuroll never started.
+///
+/// 0x898688 is ADDR_SUB_MODE, so the value is a BattleSubMode: 0 PLAYING1,
+/// 1 PLAYING2, 2 REPLAY. Netplay has always meant PLAYING2 here.
+static mut LAST_DISPATCH: Option<(usize, bool)> = None;
+
+unsafe fn trace_dispatch(sub_mode: usize, is_netplay: bool) {
+    if !replay::four_player_mod_loaded() {
+        return;
+    }
+    if LAST_DISPATCH == Some((sub_mode, is_netplay)) {
+        return;
+    }
+    LAST_DISPATCH = Some((sub_mode, is_netplay));
+
+    let arm = match (sub_mode, is_netplay) {
+        (2, false) => "replay",
+        (1, true) => "netplay, handle_online drives this battle",
+        (1, false) if ENABLE_SYNC_TEST => "local versus sync test",
+        _ => "NOTHING -- giuroll is not driving this battle",
+    };
+
+    println!(
+        "giuroll 4P: frame dispatch sub_mode={} netplay={} -> {}",
+        sub_mode, is_netplay, arm
+    );
+}
+
 unsafe extern "cdecl" fn main_hook(a: *mut ilhook::x86::Registers, _b: usize) {
     #[cfg(feature = "logtofile")]
     std::panic::set_hook(Box::new(|x| info!("panic! {:?}", x)));
@@ -3045,6 +4187,9 @@ unsafe extern "cdecl" fn main_hook(a: *mut ilhook::x86::Registers, _b: usize) {
     if framecount == 0 {
         CAMERA_ACTUAL_SMOOTH_TRANSFORM = None;
     }
+
+    BATTLE_MANAGER_RAN = true;
+    trace_dispatch(gametype_main, is_netplay);
 
     match (gametype_main, is_netplay) {
         (2, false) => {
@@ -3083,6 +4228,23 @@ unsafe extern "cdecl" fn main_hook(a: *mut ilhook::x86::Registers, _b: usize) {
                     state_sub_count,
                 )
             }
+        }
+        // Local versus. Stock giuroll does nothing here, which is why the 2v2
+        // savestate could never be exercised offline. Off unless explicitly
+        // enabled -- it deliberately stutters the game.
+        (1, false) if ENABLE_SYNC_TEST => {
+            // Arm the heap hooks, exactly as the replay and netplay arms above
+            // do. Without this REQUESTED_THREAD_ID stays 0, so
+            // heap_free_override performs each free for real instead of
+            // deferring it, and heap_alloc_override records nothing -- meaning
+            // objects the savestate covers are genuinely destroyed and their
+            // blocks handed back out between save and restore. restore then
+            // memcpys stale bytes over live memory, and the first virtual call
+            // through the wreckage is R6025 "pure virtual function call".
+            if framecount > 0 && !SYNC_TEST_FINISHED {
+                REQUESTED_THREAD_ID.store(GetCurrentThreadId(), Relaxed);
+            }
+            handle_sync_test(battle_state, cur_speed_iter)
         }
         _ => (),
     }

@@ -27,11 +27,25 @@ pub struct NetworkPacket {
     sync: Option<i32>,
 
     initial_max_rollback: Option<u8>,
+
+    /// Which seat the sender occupies, when it knows.
+    ///
+    /// Rides in a header byte the format already leaves zero rather than in a
+    /// new field, so that our packets stay readable by stock giuroll and its
+    /// stay readable by us. A 1v1 against someone running the released build
+    /// has to keep working; it simply reports None here and the single
+    /// opponent's slot is the other one.
+    slot: Option<u8>,
 }
 
 impl NetworkPacket {
     fn encode(&self) -> Box<[u8]> {
         let mut buf = [0; 400];
+        // Byte 0 is the packet type and byte 1 the host flag, both stamped by
+        // send_packet. Bytes 2 and 3 are left zero by every giuroll to date,
+        // which is what makes byte 2 usable without breaking either direction.
+        // Stored as slot+1 so that zero keeps meaning "not stated".
+        buf[2] = self.slot.map_or(0, |s| s + 1);
         buf[4..8].copy_from_slice(&self.id.to_le_bytes()); //0
         buf[8] = self.desyncdetect;
         buf[9] = self.delay;
@@ -60,6 +74,10 @@ impl NetworkPacket {
     }
 
     pub fn decode(d: &[u8]) -> Self {
+        let slot = match d[2] {
+            0 => None,
+            n => Some(n - 1),
+        };
         let id = usize::from_le_bytes(d[4..8].try_into().unwrap());
         let desyncdetect = d[8];
         let delay = d[9];
@@ -91,6 +109,7 @@ impl NetworkPacket {
             last_confirm,
             sync,
             initial_max_rollback,
+            slot,
         }
     }
 }
@@ -104,13 +123,20 @@ pub enum FrameTimeData {
 }
 
 pub struct Netcoder {
-    last_opponent_confirm: usize,
+    /// Per slot, so three peers cannot be mistaken for one another.
+    ///
+    /// These were single values when there was a single opponent, and the
+    /// dedupe below is why they cannot stay that way: `opponent_inputs[frame]`
+    /// being occupied used to mean "we already have this frame", but with three
+    /// senders it would mean "somebody's frame arrived", and the other two
+    /// would be dropped without a trace. Our own slot's entries go unused.
+    last_opponent_confirm: Vec<usize>,
 
     id: usize,
 
     //ideally we shouldn't be keeping a separate input stack from the Rollbacker but for now it's what I have
-    opponent_inputs: Vec<Option<u16>>,
-    last_opponent_input: usize,
+    opponent_inputs: Vec<Vec<Option<u16>>>,
+    last_opponent_input: Vec<usize>,
 
     inputs: Vec<u16>,
 
@@ -142,19 +168,20 @@ impl Netcoder {
     pub fn new(
         receiver: std::sync::mpsc::Receiver<(NetworkPacket, Instant)>,
         my_max_rollback: u8,
+        players: usize,
     ) -> Self {
         Self {
-            last_opponent_confirm: 0,
+            last_opponent_confirm: vec![0; players],
             inputs: Vec::new(),
 
-            opponent_inputs: Vec::new(),
+            opponent_inputs: vec![Vec::new(); players],
 
             send_times: HashMap::new(),
             recv_delays: HashMap::new(),
             real_rollback_to_be_showed: 0,
 
             last_opponent_delay: 0,
-            last_opponent_input: 0,
+            last_opponent_input: vec![0; players],
             id: 0,
             delay: 0,
             max_rollback: 6,
@@ -172,6 +199,49 @@ impl Netcoder {
             old_to_be_sent: None,
             old_input: [false; INPUT_KEYS_NUMBERS],
         }
+    }
+
+    /// The frame every peer has confirmed, which is the slowest of them.
+    ///
+    /// With one opponent this was just their number. The distinction only
+    /// appears with three, and getting it wrong the obvious way -- taking the
+    /// newest confirmation rather than the oldest -- would let the game run
+    /// ahead of a peer it has stopped hearing from, and drop the savestate it
+    /// would need to recover.
+    fn slowest_confirm(&self, local_slot: usize) -> usize {
+        self.slowest_confirm_slot(local_slot).1
+    }
+
+    /// The same, and WHICH peer it was.
+    ///
+    /// With one opponent the answer was never in doubt. With three, "a frame is
+    /// missing" without a slot number is a report that a stall happened and
+    /// nothing about whose link caused it -- which is most of what there is to
+    /// know.
+    fn slowest_confirm_slot(&self, local_slot: usize) -> (usize, usize) {
+        self.last_opponent_confirm
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| *slot != local_slot)
+            .map(|(slot, v)| (slot, *v))
+            .min_by_key(|(_, v)| *v)
+            .unwrap_or((local_slot, 0))
+    }
+
+    /// The newest frame received from the peer we have heard least from.
+    fn slowest_input(&self, local_slot: usize) -> usize {
+        self.slowest_input_slot(local_slot).1
+    }
+
+    /// The same, and which peer. See slowest_confirm_slot.
+    fn slowest_input_slot(&self, local_slot: usize) -> (usize, usize) {
+        self.last_opponent_input
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| *slot != local_slot)
+            .map(|(slot, v)| (slot, *v))
+            .min_by_key(|(_, v)| *v)
+            .unwrap_or((local_slot, 0))
     }
 
     /// returns whether or not we are allowed to proceed based on the confirmations we received
@@ -220,7 +290,18 @@ impl Netcoder {
 
             //todo, handle time data packets not ariving at all, by taking the time of arrival of the subsequent packet
 
-            if packet.id >= self.opponent_inputs.len() {
+            // Which stream does this belong to? The sender says so in a 4P
+            // session; with one opponent there is only the other seat.
+            let slot = match packet.slot {
+                Some(s) if (s as usize) < self.opponent_inputs.len() => s as usize,
+                Some(_) => continue,
+                None => 1 - rollbacker.local_slot(),
+            };
+            if slot == rollbacker.local_slot() {
+                continue;
+            }
+
+            if packet.id >= self.opponent_inputs[slot].len() {
                 if !is_p1 {
                     //self.delay = packet.delay as usize;
                     self.max_rollback = packet.max_rollback as usize;
@@ -382,22 +463,28 @@ impl Netcoder {
             }
 
             let latest = packet.id as usize; //last delay
-            while self.opponent_inputs.len() <= latest as usize {
-                self.opponent_inputs.push(None);
+            while self.opponent_inputs[slot].len() <= latest as usize {
+                self.opponent_inputs[slot].push(None);
             }
             let mut fr = latest;
 
-            self.last_opponent_input = self.last_opponent_input.max(packet.id);
+            self.last_opponent_input[slot] = self.last_opponent_input[slot].max(packet.id);
 
-            for a in (self.last_opponent_confirm + 1)..=packet.last_confirm {
-                let x = time.saturating_duration_since(*self.send_times.get(&a).unwrap());
-                self.recv_delays.insert(a, x);
+            for a in (self.last_opponent_confirm[slot] + 1)..=packet.last_confirm {
+                // Only the first peer to confirm a frame times it; the rest
+                // would be measuring their own lateness against a send that was
+                // already acknowledged.
+                if let Some(sent) = self.send_times.get(&a) {
+                    self.recv_delays
+                        .entry(a)
+                        .or_insert_with(|| time.saturating_duration_since(*sent));
+                }
             }
 
-            self.last_opponent_confirm = self.last_opponent_confirm.max(packet.last_confirm);
+            self.last_opponent_confirm[slot] = self.last_opponent_confirm[slot].max(packet.last_confirm);
 
             for a in packet.inputs {
-                if self.opponent_inputs[fr].is_none() {
+                if self.opponent_inputs[slot][fr].is_none() {
                     //println!("{:?}", self.send_times[fr].elapsed());
 
                     // rollbacking to frame 0 causes problems (such as crash)
@@ -406,17 +493,17 @@ impl Netcoder {
                         _ => a,
                     };
 
-                    self.opponent_inputs[fr] = Some(inp_a);
+                    self.opponent_inputs[slot][fr] = Some(inp_a);
 
                     // todo: move into it's own function
 
-                    let inp = (0..INPUT_KEYS_NUMBERS)
+                    let inp: [bool; INPUT_KEYS_NUMBERS] = (0..INPUT_KEYS_NUMBERS)
                         .into_iter()
                         .map(|x| (inp_a & (1 << x)) > 0)
                         .collect::<Vec<_>>()
                         .try_into()
                         .unwrap();
-                    rollbacker.enemy_inputs.insert(inp, fr);
+                    rollbacker.insert_input(slot, inp, fr);
                 }
 
                 if fr == 0 {
@@ -458,11 +545,16 @@ impl Netcoder {
             }
         }
 
-        let pause = if self.id > self.last_opponent_confirm + 30 {
+        let slowest_confirm = self.slowest_confirm(rollbacker.local_slot());
+        let slowest_input = self.slowest_input(rollbacker.local_slot());
+
+        let pause = if self.id > slowest_confirm + 30 {
             //crate::TARGET_OFFSET.fetch_add(1000 * m as i32, Relaxed);
             println!(
-                "frame is missing: id: {}, confirm: {}",
-                self.id, self.last_opponent_confirm
+                "frame is missing: id: {}, confirm: {} (waiting on peer slot {})",
+                self.id,
+                slowest_confirm,
+                self.slowest_confirm_slot(rollbacker.local_slot()).0
             );
             unsafe {
                 WARNING_FRAME_MISSING_1_COUNTDOWN = 120;
@@ -472,13 +564,15 @@ impl Netcoder {
             }
             true
         } else if self.id
-            > self.last_opponent_input
+            > slowest_input
                 + (self.max_rollback + self.delay.max(self.last_opponent_delay)).min(15)
         {
             //crate::TARGET_OFFSET.fetch_add(1000 * m as i32, Relaxed);
             println!(
-                "frame is missing for reason 2: id: {}, confirm: {}",
-                self.id, self.last_opponent_confirm
+                "frame is missing for reason 2: id: {}, input: {} (waiting on peer slot {})",
+                self.id,
+                slowest_input,
+                self.slowest_input_slot(rollbacker.local_slot()).0
             );
             unsafe {
                 WARNING_FRAME_MISSING_2_COUNTDOWN = 120;
@@ -486,7 +580,7 @@ impl Netcoder {
                     refresh_ping();
                     self.real_rollback_to_be_showed = self
                         .real_rollback_to_be_showed
-                        .max(self.id - self.last_opponent_input - 1 - self.delay);
+                        .max(self.id - slowest_input - 1 - self.delay);
                     crate::NEXT_DRAW_ROLLBACK = Some(self.real_rollback_to_be_showed as i32);
                 }
             }
@@ -497,7 +591,7 @@ impl Netcoder {
         if pause {
             if let Some(old_to_be_sent) = self.old_to_be_sent.as_mut() {
                 old_to_be_sent.last_confirm =
-                    (self.last_opponent_input).min(old_to_be_sent.id + 30);
+                    slowest_input.min(old_to_be_sent.id + 30);
                 old_to_be_sent.max_rollback = self.max_rollback as u8;
                 unsafe {
                     send_packet(old_to_be_sent.encode());
@@ -508,7 +602,7 @@ impl Netcoder {
 
         let input_head = self.id;
 
-        let input_range = self.last_opponent_confirm..=input_head;
+        let input_range = slowest_confirm..=input_head;
         let merged_current_input = self.old_input;
         self.old_input = [false; INPUT_KEYS_NUMBERS];
 
@@ -549,9 +643,13 @@ impl Netcoder {
             delay: self.delay as u8,
             max_rollback: self.max_rollback as u8,
             inputs: ivec,
-            last_confirm: (self.last_opponent_input).min(self.id + 30),
+            last_confirm: slowest_input.min(self.id + 30),
             sync: past,
             initial_max_rollback: (self.id <= 120).then_some(self.initial_my_max_rollback as u8),
+            // Say which seat this is, so three peers can be told apart. Left
+            // unstated in a 1v1, where it carries no information and its
+            // absence keeps the packet identical to stock giuroll's.
+            slot: (rollbacker.players() > 2).then(|| rollbacker.local_slot() as u8),
         };
         self.old_to_be_sent = Some(to_be_sent.clone());
 
@@ -696,6 +794,18 @@ pub unsafe fn send_packet(mut data: Box<[u8]>) {
         }
         to = (netmanager + 0x47c) as *const SOCKADDR
     }
+
+    // Straight to the peers that answered a hole punch. When every peer is
+    // reachable that way the relay carries no battle traffic at all, which is
+    // the entire point: at 150ms one-way an extra hop costs nearly two frames
+    // of a fifteen-frame budget.
+    if crate::mesh::send_to_peers(&data) {
+        return;
+    }
+
+    // Otherwise the relay still carries a copy, for whichever pair could not be
+    // punched. Peers already reached directly get that input twice and discard
+    // the repeat, which PeerInputs does for any input it has seen before.
 
     // Some mods such as InfiniteDecks hook the import table of Soku
     let soku_sendto: unsafe extern "stdcall" fn(

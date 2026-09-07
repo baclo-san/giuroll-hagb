@@ -1,0 +1,25 @@
+# Pinned because giuroll does NOT build on current nightly, and the failure is
+# confusing rather than obvious.
+#
+# src/lib.rs opens with #![feature(let_chains)] under edition 2021. Let chains
+# were later stabilised for edition 2024 ONLY, and the feature gate was
+# removed -- so on a modern nightly every `if let ... &&` in the codebase turns
+# into "let chains are only allowed in Rust 2024 or later", 13 errors deep in
+# files nobody touched. The source comment in lib.rs ("should be solved before
+# updating to 2024 edition?") is the upstream note about exactly this.
+#
+# nightly-2024-06-18 is what Hagb's CI builds with (.github/workflows/build.yml),
+# so it is the version the code is known to compile under.
+#
+# Also note: a plain `cargo build` on STABLE fails even earlier, at manifest
+# parse, because Cargo.toml uses cargo-features = ["profile-rustflags"]. And
+# the repo has two git submodules (winres, injector) that a non-recursive clone
+# silently omits, surfacing much later as "no matching package named winres".
+#
+# rust-src is kept because CI builds the tier-3 i686-win7-windows-msvc target
+# with -Z build-std; we target i686-pc-windows-msvc, which does not need it,
+# but having it means switching to the CI target costs nothing.
+[toolchain]
+channel = "nightly-2024-06-18"
+components = ["rust-src"]
+targets = ["i686-pc-windows-msvc"]
