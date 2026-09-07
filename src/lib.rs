@@ -296,7 +296,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-4";
+const FOURP_BUILD: &str = "4p-test-5";
 
 /// Compare GR version with version_string, following Semantic Versioning 2.0.0 (https://semver.org/).
 /// It returns false if version_string is an invalid version string, or

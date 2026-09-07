@@ -187,6 +187,15 @@ pub struct Netcoder {
     /// swapping between P2, P3 and P4 -- and it fed the stall threshold,
     /// so the frame budget moved around with it too.
     peer_delay: [usize; crate::peers::MAX_PLAYERS],
+    /// Whether each peer currently disagrees with us, and whether that has
+    /// already been reported.
+    ///
+    /// Per peer, not global. One flag shared by three comparisons means an
+    /// agreeing peer clears the flag a diverging one just set, so "first
+    /// seen" becomes "first seen since somebody else last agreed" -- which
+    /// is not the frame anyone wants.
+    peer_desynced: [bool; crate::peers::MAX_PLAYERS],
+    desync_reported: [bool; crate::peers::MAX_PLAYERS],
     pub last_opponent_delay: usize,
     pub initial_opponent_max_rollback: Option<usize>,
     pub initial_my_max_rollback: usize,
@@ -221,6 +230,8 @@ impl Netcoder {
             real_rollback_to_be_showed: 0,
 
             peer_delay: [0; crate::peers::MAX_PLAYERS],
+            peer_desynced: [false; crate::peers::MAX_PLAYERS],
+            desync_reported: [false; crate::peers::MAX_PLAYERS],
             last_opponent_delay: 0,
             last_opponent_input: vec![0; players],
             id: 0,
@@ -459,46 +470,57 @@ impl Netcoder {
                     //info!("packet sync data: {:?}", x)
                 }
 
+                // Desync detection.
+                //
+                // The region checksums decide it whenever both sides have
+                // them. They used to be only a sub-report of the weather
+                // byte, printed if that byte happened to differ -- and that
+                // byte is EIGHT BITS, so it agrees with a diverged peer far
+                // more often than not. A live session found the divergence
+                // only at frame 2127, by which point eleven of the twelve
+                // regions differed and the report could localise nothing:
+                // the state had gone wrong long before the byte noticed.
+                //
+                // The weather byte is still the fallback, because a 1v1
+                // carries no region checksums and has to keep working.
+                let frame = packet.id.saturating_sub(20);
                 let weather_remote = packet.desyncdetect;
-                let weather_local = rollbacker
-                    .weathers
-                    .get(&(packet.id.saturating_sub(20)))
-                    .cloned()
-                    .unwrap_or(0);
-                if weather_remote != weather_local {
-                    // Say so in the log, not only in a logtofile build.
-                    //
-                    // The on-screen DESYNCED corner was the ONLY report of
-                    // a live desync, because this line was behind
-                    // `logtofile` while every test build ships
-                    // `allocconsole`. Four logs of a session that visibly
-                    // desynced contained not one mention of it.
-                    //
-                    // Edge triggered: once a match has diverged this
-                    // compares unequal on most frames, and the frame it
-                    // FIRST went wrong is the only one worth having.
-                    unsafe {
-                        if !LIKELY_DESYNCED {
-                            let frame = packet.id.saturating_sub(20);
-                            println!(
-                                "DESYNC first seen at frame {} against peer slot {}: \
-                                 local weather {}, theirs {}",
-                                frame, slot, weather_local, weather_remote
-                            );
-                            report_regions(rollbacker, frame, slot, &packet.region_hashes);
-                        }
-                        LIKELY_DESYNCED = true;
-                    }
-                    //todo, add different desync indication !
+                let ours = rollbacker.region_hashes.get(&frame);
+                let comparable_regions = ours.is_some()
+                    && packet.region_hashes.len() == crate::rollback::REGION_NAMES.len();
+
+                let differ = if comparable_regions {
+                    ours.unwrap()[..] != packet.region_hashes[..]
+                } else if let Some(weather_local) = rollbacker.weathers.get(&frame) {
+                    // Only when we hold a real value for that frame.
+                    // Defaulting a missing one to zero made every match
+                    // report a desync at frame 0 against every peer, which
+                    // lit the on-screen warning before anyone had moved.
+                    *weather_local != weather_remote
+                } else {
+                    false
+                };
+
+                self.peer_desynced[slot] = differ;
+                unsafe {
+                    LIKELY_DESYNCED = self.peer_desynced.iter().any(|x| *x);
+                }
+
+                if differ && !self.desync_reported[slot] {
+                    self.desync_reported[slot] = true;
+                    let weather_local =
+                        rollbacker.weathers.get(&frame).cloned().unwrap_or(0);
+                    println!(
+                        "DESYNC first seen at frame {} against peer slot {}: \
+                         local weather {}, theirs {}",
+                        frame, slot, weather_local, weather_remote
+                    );
+                    unsafe { report_regions(rollbacker, frame, slot, &packet.region_hashes) };
                     #[cfg(feature = "logtofile")]
                     info!(
                         "DESYNC: local: {}, remote: {}",
                         weather_local, weather_remote
                     )
-                } else {
-                    unsafe {
-                        LIKELY_DESYNCED = false;
-                    }
                 }
             }
 
@@ -879,6 +901,18 @@ unsafe fn report_regions(
         );
         return;
     };
+    if theirs.is_empty() {
+        // Not a version problem, whatever it looks like. A peer sends none
+        // until it has retired a frame, and none at all in a 1v1. Saying
+        // "different build" here sent everyone hunting a version mismatch
+        // that did not exist.
+        println!(
+            "  peer slot {} had no checksums for frame {} yet -- too early in \
+             the match to localise",
+            slot, frame
+        );
+        return;
+    }
     if theirs.len() != REGION_NAMES.len() {
         println!(
             "  peer slot {} sent {} region checksums, this build has {} -- \
