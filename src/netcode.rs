@@ -147,6 +147,15 @@ pub struct Netcoder {
     pub delay: usize,
     pub max_rollback: usize,
     pub display_stats: bool,
+    /// Each peer's own delay setting, keyed by slot.
+    ///
+    /// `last_opponent_delay` used to be assigned straight from whichever
+    /// packet arrived most recently, which with one opponent is the same
+    /// thing and with three is whoever spoke last. It made the on-screen
+    /// figure flicker between peers -- reported live as the delay readout
+    /// swapping between P2, P3 and P4 -- and it fed the stall threshold,
+    /// so the frame budget moved around with it too.
+    peer_delay: [usize; crate::peers::MAX_PLAYERS],
     pub last_opponent_delay: usize,
     pub initial_opponent_max_rollback: Option<usize>,
     pub initial_my_max_rollback: usize,
@@ -180,6 +189,7 @@ impl Netcoder {
             recv_delays: HashMap::new(),
             real_rollback_to_be_showed: 0,
 
+            peer_delay: [0; crate::peers::MAX_PLAYERS],
             last_opponent_delay: 0,
             last_opponent_input: vec![0; players],
             id: 0,
@@ -307,13 +317,28 @@ impl Netcoder {
                     self.max_rollback = packet.max_rollback as usize;
                 }
 
+                self.peer_delay[slot] = packet.delay as usize;
+
+                // The worst peer, not the last one heard from. The budget
+                // has to cover everyone, and a readout that changes with
+                // whoever just sent a packet tells the player nothing.
+                let local = rollbacker.local_slot();
+                self.last_opponent_delay = self
+                    .peer_delay
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != local && *i < self.opponent_inputs.len())
+                    .map(|(_, d)| *d)
+                    .max()
+                    .unwrap_or(0);
+
                 if self.display_stats {
-                    unsafe { crate::NEXT_DRAW_ENEMY_DELAY = Some(packet.delay as i32) };
+                    unsafe {
+                        crate::NEXT_DRAW_ENEMY_DELAY = Some(self.last_opponent_delay as i32)
+                    };
                 } else {
                     unsafe { crate::NEXT_DRAW_ENEMY_DELAY = None };
                 }
-
-                self.last_opponent_delay = packet.delay as usize;
 
                 // is the first arrival of the newest packet
                 let last = self
@@ -410,9 +435,28 @@ impl Netcoder {
                     .cloned()
                     .unwrap_or(0);
                 if weather_remote != weather_local {
-                    //#[cfg(feature = "allocconsole")]
-                    //println!("desync");
+                    // Say so in the log, not only in a logtofile build.
+                    //
+                    // The on-screen DESYNCED corner was the ONLY report of
+                    // a live desync, because this line was behind
+                    // `logtofile` while every test build ships
+                    // `allocconsole`. Four logs of a session that visibly
+                    // desynced contained not one mention of it.
+                    //
+                    // Edge triggered: once a match has diverged this
+                    // compares unequal on most frames, and the frame it
+                    // FIRST went wrong is the only one worth having.
                     unsafe {
+                        if !LIKELY_DESYNCED {
+                            println!(
+                                "DESYNC first seen at frame {} against peer slot {}: \
+                                 local weather {}, theirs {}",
+                                packet.id.saturating_sub(20),
+                                slot,
+                                weather_local,
+                                weather_remote
+                            );
+                        }
                         LIKELY_DESYNCED = true;
                     }
                     //todo, add different desync indication !

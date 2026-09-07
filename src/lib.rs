@@ -296,7 +296,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-2";
+const FOURP_BUILD: &str = "4p-test-3";
 
 /// Compare GR version with version_string, following Semantic Versioning 2.0.0 (https://semver.org/).
 /// It returns false if version_string is an invalid version string, or
@@ -809,12 +809,6 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         *path = Some(p);
     }
 
-    // First line of every log, before anything can go wrong.
-    println!(
-        "giuroll {} ({}) -- quote this build when reporting a 4P session",
-        VERSION_STR, FOURP_BUILD
-    );
-
     let mut filepath = filename;
     filepath.push("giuroll.ini");
     //println!("{:?}", filepath);
@@ -1086,6 +1080,17 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         OUTER_HALF_WIDTH = outer_half_width as i32;
         FREEZE_MITIGATION = freeze_mitigation;
         ENABLE_PRINTLN = enable_println;
+
+        // The first line println! is capable of emitting.
+        //
+        // It cannot go any earlier: println! is gated on ENABLE_PRINTLN,
+        // which is read from the ini, so a stamp printed before this point
+        // is silently dropped. The previous build did exactly that and
+        // shipped a version stamp that never appeared in a single log.
+        println!(
+            "giuroll {} ({}) -- quote this build when reporting a 4P session",
+            VERSION_STR, FOURP_BUILD
+        );
         mesh::ENABLED = enable_mesh;
         if !enable_mesh {
             println!("giuroll: mesh disabled by ini, every pair will use the relay");
