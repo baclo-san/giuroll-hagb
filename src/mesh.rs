@@ -410,7 +410,28 @@ pub unsafe fn send_to_peers(data: &[u8]) -> bool {
         expected += 1;
         if let Some(addr) = PEERS[slot].confirmed {
             raw_send(data, &addr);
-            reached += 1;
+
+            // A peer the relay could not place never counts as reached,
+            // however convincing a punch from it looked, so the relay copy
+            // goes out as well.
+            //
+            // handle_punch verifies a punch by matching its source IP
+            // against the address the relay gave for that slot. A skipped
+            // peer has no such address -- that is what skipping means --
+            // so the check is bypassed and ANY punch claiming the slot is
+            // believed. Seen live 2026-09-08: slot 1 logged `direct path to
+            // peer 0 via 37.113.225.54 (3 of 2 peers direct)`, a nonsense
+            // count that is exactly this happening.
+            //
+            // Believing it costs everything and gains nothing. If the
+            // direct address works the peer gets the input twice and
+            // discards the repeat, and the faster copy still wins the race,
+            // so there is no latency to lose. If it does not work, this is
+            // the difference between a playable match and a peer starved of
+            // input with no fallback left.
+            if !PEERS[slot].skipped {
+                reached += 1;
+            }
         }
     }
 

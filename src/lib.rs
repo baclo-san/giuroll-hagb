@@ -289,6 +289,15 @@ unsafe fn tamper_jmp_relative_opr<T: Sized>(dst: *mut c_void, src: T) -> T {
 use version_compare::{Cmp, Version};
 const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 
+/// Which four-player test build this is, printed on the first line of the log.
+///
+/// Bump it with the release tag. Two live sessions were diagnosed against the
+/// wrong thing because players were a build behind, and one against a log from
+/// the previous session entirely -- neither is visible in a log that does not
+/// say which build wrote it. Matching the tag means a log can be tied to a
+/// download without having to ask anyone what they installed.
+const FOURP_BUILD: &str = "4p-test-2";
+
 /// Compare GR version with version_string, following Semantic Versioning 2.0.0 (https://semver.org/).
 /// It returns false if version_string is an invalid version string, or
 /// returns true and assign *result = 0 (GR version = version_str), -1 (GR version < version_str), or 1 (GR version > version_str), if version_str is valid
@@ -799,6 +808,12 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         p.push("giuroll.log");
         *path = Some(p);
     }
+
+    // First line of every log, before anything can go wrong.
+    println!(
+        "giuroll {} ({}) -- quote this build when reporting a 4P session",
+        VERSION_STR, FOURP_BUILD
+    );
 
     let mut filepath = filename;
     filepath.push("giuroll.ini");
