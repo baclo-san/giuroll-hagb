@@ -124,6 +124,12 @@ pub struct Rollbacker {
     pub self_inputs: Vec<RInput>,
 
     pub weathers: HashMap<usize, u8>,
+    /// Region checksums of each confirmed frame, for the desync report.
+    ///
+    /// Kept beside `weathers` and filled at the same moment: a frame is
+    /// only worth comparing once its inputs are agreed, or peers would be
+    /// comparing each other's guesses and every match would look broken.
+    pub region_hashes: HashMap<usize, [u32; REGION_NAMES.len()]>,
 }
 
 impl Rollbacker {
@@ -138,6 +144,7 @@ impl Rollbacker {
             enemy_inputs: (0..players).map(|_| EnemyInputHolder::new()).collect(),
             self_inputs: Vec::new(),
             weathers: HashMap::new(),
+            region_hashes: HashMap::new(),
             // future_sound: HashMap::new(),
         }
     }
@@ -228,6 +235,8 @@ impl Rollbacker {
 
             self.weathers
                 .insert(m.prev_state.number, m.prev_state.weather_sync_check);
+            self.region_hashes
+                .insert(m.prev_state.number, m.prev_state.region_hashes);
             m.prev_state.did_happen();
             #[cfg(feature = "logrollback")]
             println!("did_happen {}", m.prev_state.number);
@@ -400,6 +409,42 @@ impl RollFrame {
 static mut FPST: [u8; 108] = [0u8; 108];
 pub static mut DUMP_FRAME_TIME: Option<Duration> = None;
 pub static mut MEMORY_LEAK: usize = 0;
+/// The pieces of the savestate a desync report can name, in dump order.
+///
+/// The stock detector compares ONE byte -- a weather value from 20 frames back
+/// -- so it can say a match diverged and nothing else. That is enough in a 1v1
+/// where there are two things it could have been. With four characters, two of
+/// them driven by a mod, "you desynced" leaves the whole state as the suspect.
+///
+/// Each name covers a contiguous run of the dump, so a mismatch points at the
+/// object that actually differs. Both peers run the same build, so the order is
+/// the contract and only the hashes travel.
+pub const REGION_NAMES: [&str; 12] = [
+    "weather",
+    "stage",
+    "objects",
+    "info",
+    "battle manager",
+    "netmanager",
+    "game data",
+    "player 1",
+    "player 2",
+    "player 3",
+    "player 4",
+    "tail",
+];
+
+/// FNV-1a. Chosen for being short enough to read and fast enough to run on
+/// every dumped frame; this detects difference, it does not resist anyone.
+fn hash_region(seed: u32, bytes: &[u8]) -> u32 {
+    let mut h = seed;
+    for b in bytes {
+        h ^= *b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
 pub unsafe fn dump_frame(
     extra_allocs: Option<impl Iterator<Item = usize>>,
     extra_frees: Option<impl Iterator<Item = usize>>,
@@ -427,6 +472,11 @@ pub unsafe fn dump_frame(
     if ISDEBUG {
         info!("0x895ec")
     };
+    // Where each region starts, as an index into `m`. One past the end is
+    // the final entry, so region i is m[region_start[i]..region_start[i+1]].
+    let mut region_start = [0usize; REGION_NAMES.len() + 1];
+
+    region_start[0] = m.len();
     let ptr1 = read_addr(0x8985ec, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
     m.push(read_addr(first, 0xec));
@@ -466,6 +516,7 @@ pub unsafe fn dump_frame(
     if ISDEBUG {
         info!("0x8985e0")
     };
+    region_start[1] = m.len();
     let ptr1 = read_addr(0x8985e0, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
     m.push(read_addr(first, 0x118));
@@ -502,6 +553,7 @@ pub unsafe fn dump_frame(
     //let ptr1 = read_addr(0x8985f0, 0x4);
     //let first = get_ptr(&ptr1.content[0..4], 0);
 
+    region_start[2] = m.len();
     let first = *(0x8985f0 as *const usize);
 
     m.push(read_addr(first, 0x94));
@@ -556,6 +608,7 @@ pub unsafe fn dump_frame(
         }
     }
 
+    region_start[3] = m.len();
     let ptr1 = read_addr(0x8985e8, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
 
@@ -577,6 +630,7 @@ pub unsafe fn dump_frame(
         info!("0x8985e4")
     };
 
+    region_start[4] = m.len();
     let p_battle_manager = read_addr(0x8985e4, 0x4);
     let p_battle_manager = get_ptr(&p_battle_manager.content[0..4], 0);
     m.push(read_addr(p_battle_manager, 0x908));
@@ -621,6 +675,7 @@ pub unsafe fn dump_frame(
 
     //here sokuroll locks a mutex, but it seems unnecceseary
 
+    region_start[5] = m.len();
     let ptr1 = read_addr(0x8986a0, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
     // netplay input buffer. TODO: find corresponding input buffers in replay mode
@@ -852,15 +907,18 @@ pub unsafe fn dump_frame(
         }
     };
 
+    region_start[6] = m.len();
     let p_game_manager = read_addr(0x8985dc, 0x4);
     let p_game_manager = get_ptr(&p_game_manager.content[0..4], 0);
 
     m.push(read_addr(p_game_manager, 0x58));
     m.push(read_vec(p_game_manager + 0x40).read_underlying());
 
+    region_start[7] = m.len();
     let p1 = get_player(p_game_manager, 0).unwrap();
     read_player_data(p1, &mut m);
 
+    region_start[8] = m.len();
     let p2 = get_player(p_game_manager, 1).unwrap();
     read_player_data(p2, &mut m);
 
@@ -906,6 +964,9 @@ pub unsafe fn dump_frame(
     };
 
     for n in [2usize, 3usize] {
+        // An absent assist leaves its region empty rather than shifting the
+        // later ones, so the two peers still line up name for name.
+        region_start[7 + n] = m.len();
         // enabledPlayers first, so a future engine or mod that does set it
         // keeps working through the path it expects.
         if let Some(p) = get_player(p_game_manager, n).or_else(|| assist_player(n)) {
@@ -921,6 +982,7 @@ pub unsafe fn dump_frame(
         info!("bullets done");
     }
 
+    region_start[11] = m.len();
     m.push(read_addr(0x898718, 0x128));
 
     let sc1 = *(0x89881c as *const usize);
@@ -1000,6 +1062,22 @@ pub unsafe fn dump_frame(
     }
     assert_eq!(buf_size, buf.len());
 
+    region_start[REGION_NAMES.len()] = m.len();
+
+    // Hashed from `m` rather than from `buf` so the padding inserted to
+    // keep chunks 4-aligned stays out of it: those bytes are whatever the
+    // allocator left behind and would differ between machines that agree.
+    let mut region_hashes = [0u32; REGION_NAMES.len()];
+    for i in 0..REGION_NAMES.len() {
+        let start = region_start[i].min(m.len());
+        let end = region_start[i + 1].min(m.len()).max(start);
+        let mut h = 2166136261u32;
+        for addr in &m[start..end] {
+            h = hash_region(h, &addr.content);
+        }
+        region_hashes[i] = h;
+    }
+
     LAST_M_LEN = m.len();
 
     let mut alloc: Vec<usize> = MEMORY_RECEIVER_ALLOC.as_ref().unwrap().try_iter().collect();
@@ -1017,6 +1095,7 @@ pub unsafe fn dump_frame(
         extra_states,
         weather_sync_check: ((*(0x8971c4 as *const usize) * 16) + (*(0x8971c4 as *const usize) * 1)
             & 0xFF) as u8,
+        region_hashes,
         has_happened: false,
         has_called_never_happened: false,
         last_shake_before_smooth: LAST_CAMERA_BEFORE_SMOOTH.clone(),
@@ -1342,6 +1421,8 @@ pub struct Frame {
     pub extra_states: Vec<ExtraState>,
 
     pub weather_sync_check: u8,
+    /// One checksum per REGION_NAMES entry, in that order.
+    pub region_hashes: [u32; REGION_NAMES.len()],
     pub has_called_never_happened: bool,
     pub has_happened: bool,
     pub last_shake_before_smooth: Option<CameraTransform>,

@@ -28,6 +28,15 @@ pub struct NetworkPacket {
 
     initial_max_rollback: Option<u8>,
 
+    /// Per-region checksums of frame `id - 20`, in REGION_NAMES order.
+    ///
+    /// Empty in a 1v1, where `desyncdetect` already answers the only
+    /// question worth asking and the packet has to stay byte-identical to
+    /// stock giuroll's. Byte 3 of the header carries the count, so a
+    /// receiver that has never heard of this reads zero of them and parses
+    /// exactly what it always did.
+    region_hashes: Vec<u32>,
+
     /// Which seat the sender occupies, when it knows.
     ///
     /// Rides in a header byte the format already leaves zero rather than in a
@@ -46,6 +55,7 @@ impl NetworkPacket {
         // which is what makes byte 2 usable without breaking either direction.
         // Stored as slot+1 so that zero keeps meaning "not stated".
         buf[2] = self.slot.map_or(0, |s| s + 1);
+        buf[3] = self.region_hashes.len() as u8;
         buf[4..8].copy_from_slice(&self.id.to_le_bytes()); //0
         buf[8] = self.desyncdetect;
         buf[9] = self.delay;
@@ -64,6 +74,14 @@ impl NetworkPacket {
 
         buf[next..next + 4].copy_from_slice(&self.sync.unwrap_or(i32::MAX).to_le_bytes());
         let mut last = next + 4;
+
+        // Before initial_max_rollback, whose presence is inferred from the
+        // packet length -- appending after it would make that inference
+        // read a checksum byte as a rollback setting.
+        for h in &self.region_hashes {
+            buf[last..last + 4].copy_from_slice(&h.to_le_bytes());
+            last += 4;
+        }
 
         if let Some(initial_max_rollback) = self.initial_max_rollback {
             buf[last] = initial_max_rollback;
@@ -98,6 +116,18 @@ impl NetworkPacket {
         };
 
         let lastend = lastend + 4 as usize;
+
+        let region_count = d[3] as usize;
+        let region_hashes: Vec<u32> = (0..region_count)
+            .filter(|i| d.len() >= lastend + (i + 1) * 4)
+            .map(|i| {
+                u32::from_le_bytes(
+                    d[lastend + i * 4..lastend + (i + 1) * 4].try_into().unwrap(),
+                )
+            })
+            .collect();
+        let lastend = lastend + region_hashes.len() * 4;
+
         let initial_max_rollback = (d.len() > lastend).then(|| d[lastend]);
 
         Self {
@@ -109,6 +139,7 @@ impl NetworkPacket {
             last_confirm,
             sync,
             initial_max_rollback,
+            region_hashes,
             slot,
         }
     }
@@ -448,14 +479,13 @@ impl Netcoder {
                     // FIRST went wrong is the only one worth having.
                     unsafe {
                         if !LIKELY_DESYNCED {
+                            let frame = packet.id.saturating_sub(20);
                             println!(
                                 "DESYNC first seen at frame {} against peer slot {}: \
                                  local weather {}, theirs {}",
-                                packet.id.saturating_sub(20),
-                                slot,
-                                weather_local,
-                                weather_remote
+                                frame, slot, weather_local, weather_remote
                             );
+                            report_regions(rollbacker, frame, slot, &packet.region_hashes);
                         }
                         LIKELY_DESYNCED = true;
                     }
@@ -690,6 +720,17 @@ impl Netcoder {
             last_confirm: slowest_input.min(self.id + 30),
             sync: past,
             initial_max_rollback: (self.id <= 120).then_some(self.initial_my_max_rollback as u8),
+            // Same frame `desyncdetect` describes, so both are checked
+            // against one another rather than against two different frames.
+            region_hashes: if rollbacker.players() > 2 {
+                rollbacker
+                    .region_hashes
+                    .get(&self.id.saturating_sub(20))
+                    .map(|h| h.to_vec())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             // Say which seat this is, so three peers can be told apart. Left
             // unstated in a 1v1, where it carries no information and its
             // absence keeps the packet identical to stock giuroll's.
@@ -809,6 +850,68 @@ impl Netcoder {
 
             self.id += 1;
             m as u32
+        }
+    }
+}
+
+/// Name the parts of the state that disagree, on the frame they first did.
+///
+/// The weather byte says a match diverged; this says where. Both peers dump the
+/// state in the same order, so the checksums line up index for index and only
+/// the numbers have to travel.
+///
+/// Reports the regions that MATCH as well, because that is often the more
+/// useful half: "player 3 differs, everything else agrees" points somewhere,
+/// and so does "everything differs", which means the divergence is older than
+/// this frame and the report has arrived too late to localise anything.
+unsafe fn report_regions(
+    rollbacker: &Rollbacker,
+    frame: usize,
+    slot: usize,
+    theirs: &[u32],
+) {
+    use crate::rollback::REGION_NAMES;
+
+    let Some(ours) = rollbacker.region_hashes.get(&frame) else {
+        println!(
+            "  no region checksums kept for frame {} -- cannot say which part diverged",
+            frame
+        );
+        return;
+    };
+    if theirs.len() != REGION_NAMES.len() {
+        println!(
+            "  peer slot {} sent {} region checksums, this build has {} -- \
+             it is running a different giuroll, which is the thing to fix first",
+            slot,
+            theirs.len(),
+            REGION_NAMES.len()
+        );
+        return;
+    }
+
+    let differing: Vec<&str> = REGION_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| ours[*i] != theirs[*i])
+        .map(|(_, n)| *n)
+        .collect();
+
+    if differing.is_empty() {
+        println!(
+            "  every region agrees on frame {}, so only the weather byte differs",
+            frame
+        );
+        return;
+    }
+    println!(
+        "  regions differing on frame {}: {}",
+        frame,
+        differing.join(", ")
+    );
+    for (i, name) in REGION_NAMES.iter().enumerate() {
+        if ours[i] != theirs[i] {
+            println!("    {:<16} local {:08x}  slot {} {:08x}", name, ours[i], slot, theirs[i]);
         }
     }
 }
