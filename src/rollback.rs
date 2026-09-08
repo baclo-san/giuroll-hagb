@@ -235,8 +235,11 @@ impl Rollbacker {
 
             self.weathers
                 .insert(m.prev_state.number, m.prev_state.weather_sync_check);
-            self.region_hashes
-                .insert(m.prev_state.number, m.prev_state.region_hashes);
+            let mut region_hashes = m.prev_state.region_hashes;
+            let n = REGION_NAMES.len();
+            region_hashes[n - 2] = pack_input_pair(&m.inputs, 0);
+            region_hashes[n - 1] = pack_input_pair(&m.inputs, 2);
+            self.region_hashes.insert(m.prev_state.number, region_hashes);
             m.prev_state.did_happen();
             #[cfg(feature = "logrollback")]
             println!("did_happen {}", m.prev_state.number);
@@ -423,7 +426,7 @@ pub static mut MEMORY_LEAK: usize = 0;
 /// how much health it has. They are what the simulation is FOR, they are
 /// identical on two machines in sync, and when they are not, the numbers
 /// themselves say what went wrong rather than merely that something did.
-pub const REGION_NAMES: [&str; 12] = [
+pub const REGION_NAMES: [&str; 14] = [
     "player 1 pos x",
     "player 1 pos y",
     "player 1 action/hp",
@@ -436,7 +439,37 @@ pub const REGION_NAMES: [&str; 12] = [
     "player 4 pos x",
     "player 4 pos y",
     "player 4 action/hp",
+    // The inputs the frame was simulated with, not state produced by it.
+    //
+    // Every desync report so far compared only STATE, which says the
+    // machines disagreed without saying whether they were fed the same
+    // thing to begin with. Inputs are the one thing rollback requires to
+    // be identical everywhere: a frame is retired only once every peer has
+    // been heard from, so by the time these are recorded they are the
+    // confirmed inputs and must match. If they differ the fault is in
+    // delivery or routing; if they match it is in the simulation. That is
+    // the first fork in any desync hunt and we have been guessing at it.
+    "inputs p1+p2",
+    "inputs p3+p4",
 ];
+
+/// Two slots' 12-bit input masks packed into one word, `first` in the high
+/// half. A slot with no input reads as zero, the same as no buttons held --
+/// harmless, because a slot that does not exist does not exist anywhere.
+fn pack_input_pair(inputs: &[RInput], first: usize) -> u32 {
+    let mask = |slot: usize| -> u32 {
+        match inputs.get(slot) {
+            None => 0,
+            Some(i) => i
+                .iter()
+                .enumerate()
+                .filter(|(_, held)| **held)
+                .map(|(bit, _)| 1u32 << bit)
+                .sum(),
+        }
+    };
+    (mask(first) << 16) | mask(first + 1)
+}
 
 pub unsafe fn dump_frame(
     extra_allocs: Option<impl Iterator<Item = usize>>,

@@ -951,7 +951,21 @@ unsafe fn report_regions(
         if ours[i] == theirs[i] {
             continue;
         }
-        if i % 3 == 2 {
+        if i >= REGION_NAMES.len() - 2 {
+            // Which buttons, for which two players. An input line here
+            // means the machines never agreed on what was pressed, and
+            // nothing about the simulation is worth reading until that is
+            // fixed.
+            println!(
+                "    {:<20} local {:04x}/{:04x}  slot {} {:04x}/{:04x}",
+                name,
+                ours[i] >> 16,
+                ours[i] & 0xffff,
+                slot,
+                theirs[i] >> 16,
+                theirs[i] & 0xffff
+            );
+        } else if i % 3 == 2 {
             println!(
                 "    {:<20} local action {} hp {}  slot {} action {} hp {}",
                 name,

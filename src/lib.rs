@@ -296,7 +296,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-7";
+const FOURP_BUILD: &str = "4p-test-8";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
@@ -478,6 +478,75 @@ static mut REAL_INPUTS: [Option<[bool; INPUT_KEYS_NUMBERS]>; MAX_INJECTED_PLAYER
     [None; MAX_INJECTED_PLAYERS];
 static mut REAL_INPUT_CURSOR: usize = 0;
 
+/// The KeymapManager each slot polls through, rebuilt every simulated
+/// frame.
+///
+/// Injection used to work by POSITION: the first poll of a frame got slot
+/// 0, the second slot 1, and so on. That is not a fact about the engine,
+/// it is an assumption about how many times it polls and in what order --
+/// true for vanilla's two players, and true for 4PSoku's four on the one
+/// machine it was checked on. Nothing enforced it. One extra or missing
+/// poll shifts every slot after it, which does not corrupt anything or
+/// crash: it quietly hands one player's inputs to a different character,
+/// on one machine and not the others. That is indistinguishable from a
+/// desync from the outside, and it is exactly what "my spellcard did not
+/// come out on his screen" looks like.
+///
+/// Each poll states which manager it is for, and each player names its own
+/// through CharacterManager+0x750 -> KeyManager -> KeymapManager, so the
+/// mapping can be read rather than assumed. Zero means unresolved.
+static mut SLOT_MANAGERS: [usize; MAX_INJECTED_PLAYERS] = [0; MAX_INJECTED_PLAYERS];
+
+/// Whether SLOT_MANAGERS is trustworthy enough to route by.
+///
+/// Demanding every slot resolve to a DISTINCT manager is what makes this
+/// safe to leave on outside a 2v2. 4PSoku stays loaded through vanilla
+/// 1v1, practice and replays, where the P3/P4 slots hold whatever was left
+/// behind; a stale pointer that still looks plausible would otherwise
+/// resolve to a stale manager and silently claim a poll.
+static mut SLOT_MANAGERS_VALID: bool = false;
+
+/// Read the poll-to-slot mapping out of the engine.
+unsafe fn refresh_slot_managers(players: usize) {
+    SLOT_MANAGERS = [0; MAX_INJECTED_PLAYERS];
+    SLOT_MANAGERS_VALID = false;
+
+    let plausible = |a: usize| (0x00400000..0x7fff0000).contains(&a);
+    let battle_manager = *(0x008985E4 as *const usize);
+    if !plausible(battle_manager) || players == 0 || players > MAX_INJECTED_PLAYERS {
+        return;
+    }
+
+    for n in 0..players {
+        let player = *ptr_wrap!((battle_manager + 0xc + n * 4) as *const usize);
+        if !plausible(player) {
+            return;
+        }
+        let key_manager = *ptr_wrap!((player + 0x750) as *const usize);
+        if !plausible(key_manager) {
+            return;
+        }
+        let manager = *ptr_wrap!(key_manager as *const usize);
+        if !plausible(manager) {
+            return;
+        }
+        SLOT_MANAGERS[n] = manager;
+    }
+
+    // Two slots naming one manager means at least one of them is stale,
+    // and routing on it would be worse than the ordering it replaces.
+    for a in 0..players {
+        for b in (a + 1)..players {
+            if SLOT_MANAGERS[a] == SLOT_MANAGERS[b] {
+                SLOT_MANAGERS = [0; MAX_INJECTED_PLAYERS];
+                return;
+            }
+        }
+    }
+
+    SLOT_MANAGERS_VALID = true;
+}
+
 /// How many times the engine has polled for input since the queue was last
 /// filled. Only the sync test reads it: if the two runs of one frame poll a
 /// different number of times, they were not fed the same inputs, and any
@@ -498,8 +567,18 @@ static mut POLL_HISTORY: [(usize, i32, i32, u32); MAX_INJECTED_PLAYERS] =
 
 /// Take the next queued input, or None once the queue for this frame is spent
 /// -- which is the signal to let the real hardware poll happen.
-unsafe fn next_injected_input() -> Option<[bool; INPUT_KEYS_NUMBERS]> {
+unsafe fn next_injected_input(input_manager: usize) -> Option<[bool; INPUT_KEYS_NUMBERS]> {
     INJECT_POLLS += 1;
+
+    // By identity wherever the engine will say who is asking.
+    if SLOT_MANAGERS_VALID {
+        let slot = SLOT_MANAGERS.iter().position(|m| *m == input_manager)?;
+        return REAL_INPUTS[slot].take();
+    }
+
+    // Character select, menus, replays, anything before the battle manager
+    // exists: no mapping to read, so fall back to poll order, which is what
+    // this always did.
     let slot = REAL_INPUT_CURSOR;
     if slot >= MAX_INJECTED_PLAYERS {
         return None;
@@ -1951,7 +2030,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         (*a).ebp = *ptr_wrap!(((*a).esi + 0x76c) as *const u32);
         let input_manager = (*a).ecx as usize;
 
-        let real_input = match next_injected_input() {
+        let real_input = match next_injected_input(input_manager) {
             Some(x) => x,
             None => {
                 IS_FIRST_READ_INPUTS = false;
@@ -2409,6 +2488,8 @@ unsafe fn set_input_buffers_opt(inputs: &[Option<[bool; INPUT_KEYS_NUMBERS]>]) {
     }
     REAL_INPUT_CURSOR = 0;
     INJECT_POLLS = 0;
+    // Once per simulated frame, immediately before the polls it routes.
+    refresh_slot_managers(inputs.len());
 }
 //might not be neccesseary
 static REQUESTED_THREAD_ID: AtomicU32 = AtomicU32::new(0);
