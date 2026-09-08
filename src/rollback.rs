@@ -409,41 +409,34 @@ impl RollFrame {
 static mut FPST: [u8; 108] = [0u8; 108];
 pub static mut DUMP_FRAME_TIME: Option<Duration> = None;
 pub static mut MEMORY_LEAK: usize = 0;
-/// The pieces of the savestate a desync report can name, in dump order.
+/// What a desync report compares, three values per player.
 ///
-/// The stock detector compares ONE byte -- a weather value from 20 frames back
-/// -- so it can say a match diverged and nothing else. That is enough in a 1v1
-/// where there are two things it could have been. With four characters, two of
-/// them driven by a mod, "you desynced" leaves the whole state as the suspect.
+/// NOT a hash of the savestate, which is what this was and why it could not
+/// work. The dump is raw memory and raw memory is full of POINTERS -- heap
+/// addresses of bullets, list nodes, frame data -- and those differ between two
+/// machines that are simulating the same match perfectly. Hashing them made
+/// every region differ every time: a live session compared two peers at frame 0
+/// and reported all eleven regions in disagreement while the weather byte, the
+/// one thing being compared that was actually a game value, agreed.
 ///
-/// Each name covers a contiguous run of the dump, so a mismatch points at the
-/// object that actually differs. Both peers run the same build, so the order is
-/// the contract and only the hashes travel.
+/// These are game values instead: where each character is, what it is doing and
+/// how much health it has. They are what the simulation is FOR, they are
+/// identical on two machines in sync, and when they are not, the numbers
+/// themselves say what went wrong rather than merely that something did.
 pub const REGION_NAMES: [&str; 12] = [
-    "weather",
-    "stage",
-    "objects",
-    "info",
-    "battle manager",
-    "netmanager",
-    "game data",
-    "player 1",
-    "player 2",
-    "player 3",
-    "player 4",
-    "tail",
+    "player 1 pos x",
+    "player 1 pos y",
+    "player 1 action/hp",
+    "player 2 pos x",
+    "player 2 pos y",
+    "player 2 action/hp",
+    "player 3 pos x",
+    "player 3 pos y",
+    "player 3 action/hp",
+    "player 4 pos x",
+    "player 4 pos y",
+    "player 4 action/hp",
 ];
-
-/// FNV-1a. Chosen for being short enough to read and fast enough to run on
-/// every dumped frame; this detects difference, it does not resist anyone.
-fn hash_region(seed: u32, bytes: &[u8]) -> u32 {
-    let mut h = seed;
-    for b in bytes {
-        h ^= *b as u32;
-        h = h.wrapping_mul(16777619);
-    }
-    h
-}
 
 pub unsafe fn dump_frame(
     extra_allocs: Option<impl Iterator<Item = usize>>,
@@ -472,11 +465,6 @@ pub unsafe fn dump_frame(
     if ISDEBUG {
         info!("0x895ec")
     };
-    // Where each region starts, as an index into `m`. One past the end is
-    // the final entry, so region i is m[region_start[i]..region_start[i+1]].
-    let mut region_start = [0usize; REGION_NAMES.len() + 1];
-
-    region_start[0] = m.len();
     let ptr1 = read_addr(0x8985ec, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
     m.push(read_addr(first, 0xec));
@@ -516,7 +504,6 @@ pub unsafe fn dump_frame(
     if ISDEBUG {
         info!("0x8985e0")
     };
-    region_start[1] = m.len();
     let ptr1 = read_addr(0x8985e0, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
     m.push(read_addr(first, 0x118));
@@ -553,7 +540,6 @@ pub unsafe fn dump_frame(
     //let ptr1 = read_addr(0x8985f0, 0x4);
     //let first = get_ptr(&ptr1.content[0..4], 0);
 
-    region_start[2] = m.len();
     let first = *(0x8985f0 as *const usize);
 
     m.push(read_addr(first, 0x94));
@@ -608,7 +594,6 @@ pub unsafe fn dump_frame(
         }
     }
 
-    region_start[3] = m.len();
     let ptr1 = read_addr(0x8985e8, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
 
@@ -630,7 +615,6 @@ pub unsafe fn dump_frame(
         info!("0x8985e4")
     };
 
-    region_start[4] = m.len();
     let p_battle_manager = read_addr(0x8985e4, 0x4);
     let p_battle_manager = get_ptr(&p_battle_manager.content[0..4], 0);
     m.push(read_addr(p_battle_manager, 0x908));
@@ -675,7 +659,6 @@ pub unsafe fn dump_frame(
 
     //here sokuroll locks a mutex, but it seems unnecceseary
 
-    region_start[5] = m.len();
     let ptr1 = read_addr(0x8986a0, 0x4);
     let first = get_ptr(&ptr1.content[0..4], 0);
     // netplay input buffer. TODO: find corresponding input buffers in replay mode
@@ -907,18 +890,15 @@ pub unsafe fn dump_frame(
         }
     };
 
-    region_start[6] = m.len();
     let p_game_manager = read_addr(0x8985dc, 0x4);
     let p_game_manager = get_ptr(&p_game_manager.content[0..4], 0);
 
     m.push(read_addr(p_game_manager, 0x58));
     m.push(read_vec(p_game_manager + 0x40).read_underlying());
 
-    region_start[7] = m.len();
     let p1 = get_player(p_game_manager, 0).unwrap();
     read_player_data(p1, &mut m);
 
-    region_start[8] = m.len();
     let p2 = get_player(p_game_manager, 1).unwrap();
     read_player_data(p2, &mut m);
 
@@ -964,9 +944,6 @@ pub unsafe fn dump_frame(
     };
 
     for n in [2usize, 3usize] {
-        // An absent assist leaves its region empty rather than shifting the
-        // later ones, so the two peers still line up name for name.
-        region_start[7 + n] = m.len();
         // enabledPlayers first, so a future engine or mod that does set it
         // keeps working through the path it expects.
         if let Some(p) = get_player(p_game_manager, n).or_else(|| assist_player(n)) {
@@ -982,7 +959,6 @@ pub unsafe fn dump_frame(
         info!("bullets done");
     }
 
-    region_start[11] = m.len();
     m.push(read_addr(0x898718, 0x128));
 
     let sc1 = *(0x89881c as *const usize);
@@ -1062,20 +1038,25 @@ pub unsafe fn dump_frame(
     }
     assert_eq!(buf_size, buf.len());
 
-    region_start[REGION_NAMES.len()] = m.len();
-
-    // Hashed from `m` rather than from `buf` so the padding inserted to
-    // keep chunks 4-aligned stays out of it: those bytes are whatever the
-    // allocator left behind and would differ between machines that agree.
+    // Three game values per player, taken from the battle manager's own
+    // player array -- the one place all four are reachable, and the same
+    // array 4PSoku fills for the assists.
+    //
+    // Offsets are SokuLib's: position at +0xec as two floats, frameState at
+    // +0x13c starting with actionId, HP at +0x184. Floats travel as their
+    // bits, so two machines in sync compare equal and one that has drifted
+    // by a fraction of a pixel still shows up.
     let mut region_hashes = [0u32; REGION_NAMES.len()];
-    for i in 0..REGION_NAMES.len() {
-        let start = region_start[i].min(m.len());
-        let end = region_start[i + 1].min(m.len()).max(start);
-        let mut h = 2166136261u32;
-        for addr in &m[start..end] {
-            h = hash_region(h, &addr.content);
+    for n in 0..4usize {
+        let p = *ptr_wrap!((p_battle_manager + 0xc + n * 4) as *const usize);
+        if !(0x00400000..0x7fff0000).contains(&p) {
+            continue;
         }
-        region_hashes[i] = h;
+        region_hashes[n * 3] = *ptr_wrap!((p + 0xec) as *const u32);
+        region_hashes[n * 3 + 1] = *ptr_wrap!((p + 0xf0) as *const u32);
+        let action = *ptr_wrap!((p + 0x13c) as *const u16) as u32;
+        let hp = *ptr_wrap!((p + 0x184) as *const u16) as u32;
+        region_hashes[n * 3 + 2] = (action << 16) | hp;
     }
 
     LAST_M_LEN = m.len();

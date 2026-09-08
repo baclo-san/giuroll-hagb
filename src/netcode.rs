@@ -943,9 +943,32 @@ unsafe fn report_regions(
         frame,
         differing.join(", ")
     );
+    // Printed as the values they are. A hash would say two numbers differ;
+    // these say a character is in the wrong place, or in the wrong move, or
+    // took damage on one machine and not the other -- which is usually
+    // enough to know what to look at without reading any more of the log.
     for (i, name) in REGION_NAMES.iter().enumerate() {
-        if ours[i] != theirs[i] {
-            println!("    {:<16} local {:08x}  slot {} {:08x}", name, ours[i], slot, theirs[i]);
+        if ours[i] == theirs[i] {
+            continue;
+        }
+        if i % 3 == 2 {
+            println!(
+                "    {:<20} local action {} hp {}  slot {} action {} hp {}",
+                name,
+                ours[i] >> 16,
+                ours[i] & 0xffff,
+                slot,
+                theirs[i] >> 16,
+                theirs[i] & 0xffff
+            );
+        } else {
+            println!(
+                "    {:<20} local {}  slot {} {}",
+                name,
+                f32::from_bits(ours[i]),
+                slot,
+                f32::from_bits(theirs[i])
+            );
         }
     }
 }
