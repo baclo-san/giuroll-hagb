@@ -296,7 +296,54 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-6";
+const FOURP_BUILD: &str = "4p-test-7";
+
+/// The x87 control word to force each frame, or -1 to leave it alone.
+///
+/// Soku does its arithmetic on the x87 FPU, whose PRECISION is a runtime
+/// setting rather than a property of the code: bits 8-9 of this register
+/// choose a 24, 53 or 64 bit mantissa, and the same instructions on the same
+/// inputs give different results under each. Direct3D9 sets it when a device
+/// is created unless asked not to, so what a Soku process ends up with is
+/// decided by the graphics stack -- and Wine's is not obliged to match
+/// Windows'.
+///
+/// That is a rollback desync with no bug anywhere in the netcode: both
+/// machines simulate their own frames perfectly and consistently, and drift
+/// apart in the last bits of every float. It shows up as positions slowly
+/// separating, which is what a live Linux-versus-Windows session reported.
+///
+/// Left off by default because forcing a value that disagrees with the peers
+/// would CAUSE the thing it prevents. Read the control words out of the logs
+/// first, then set every player to the same one.
+static mut FORCE_FPU_CW: i64 = -1;
+
+/// The x87 control word this process is currently running with.
+unsafe fn read_fpu_control_word() -> u16 {
+    let mut cw: u16 = 0;
+    core::arch::asm!("fnstcw word ptr [{}]", in(reg) &mut cw);
+    cw
+}
+
+unsafe fn set_fpu_control_word(cw: u16) {
+    core::arch::asm!("fldcw word ptr [{}]", in(reg) &cw);
+}
+
+fn describe_fpu_control_word(cw: u16) -> String {
+    let precision = match (cw >> 8) & 3 {
+        0 => "24-bit single",
+        2 => "53-bit double",
+        3 => "64-bit extended",
+        _ => "reserved",
+    };
+    let rounding = match (cw >> 10) & 3 {
+        0 => "nearest",
+        1 => "down",
+        2 => "up",
+        _ => "truncate",
+    };
+    format!("0x{:04x} (precision {}, rounding {})", cw, precision, rounding)
+}
 
 /// Compare GR version with version_string, following Semantic Versioning 2.0.0 (https://semver.org/).
 /// It returns false if version_string is an invalid version string, or
@@ -930,6 +977,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
     );
     let enable_check_mode = read_ini_bool(&conf, "Misc", "enable_check_mode", false);
     let enable_mesh = read_ini_bool(&conf, "Netplay", "enable_mesh", true);
+    let force_fpu_cw = read_ini_int_hex(&conf, "Netplay", "fpu_control_word", -1);
     let enable_sync_test = read_ini_bool(&conf, "Misc", "enable_sync_test", false);
     let turning_off_all_extra_ui = read_ini_bool(
         &conf,
@@ -1091,6 +1139,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
             "giuroll {} ({}) -- quote this build when reporting a 4P session",
             VERSION_STR, FOURP_BUILD
         );
+        FORCE_FPU_CW = force_fpu_cw;
         mesh::ENABLED = enable_mesh;
         if !enable_mesh {
             println!("giuroll: mesh disabled by ini, every pair will use the relay");
@@ -3902,6 +3951,13 @@ unsafe fn handle_online(
             None => (2, if is_p1() { 0 } else { 1 }),
         };
         println!("giuroll: {} players, we are slot {}", players, local_slot);
+        // Compare this line between players before reading anything else in
+        // a desync report. Two machines running different precision cannot
+        // stay in sync no matter how correct the netcode is.
+        println!(
+            "giuroll: x87 control word {}",
+            describe_fpu_control_word(read_fpu_control_word())
+        );
         if players > 2 {
             mesh::LOCAL_SLOT = Some(local_slot);
             println!(
@@ -4206,6 +4262,11 @@ unsafe extern "cdecl" fn main_hook(a: *mut ilhook::x86::Registers, _b: usize) {
     IS_FIRST_READ_INPUTS = true;
     if framecount == 0 {
         CAMERA_ACTUAL_SMOOTH_TRANSFORM = None;
+    }
+
+    // Before the frame is simulated, so re-simulated frames get it too.
+    if FORCE_FPU_CW >= 0 {
+        set_fpu_control_word(FORCE_FPU_CW as u16);
     }
 
     BATTLE_MANAGER_RAN = true;
