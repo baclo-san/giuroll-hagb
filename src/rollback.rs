@@ -984,6 +984,12 @@ pub unsafe fn dump_frame(
         }
     }
 
+    // 4PSoku's own simulation state, which lives in its DLL rather than in
+    // any structure the walk above reaches. See four_player_rollback_state.
+    if let Some((address, size)) = crate::replay::four_player_rollback_state() {
+        m.push(read_addr(address, size));
+    }
+
     assert_eq!(*((p_battle_manager + 0xc + 0 * 4) as *const usize), p1);
     assert_eq!(*((p_battle_manager + 0xc + 1 * 4) as *const usize), p2);
 

@@ -433,6 +433,52 @@ pub(crate) fn four_player_local_slot() -> Option<usize> {
     }
 }
 
+/// Where 4PSoku keeps its own simulation state, as (address, size).
+///
+/// The mod has counters of its own that decide what happens in a match -- the
+/// healing timer that revives a dead teammate is the one that bit us. They live
+/// in 4PSoku.dll's data section, where dump_frame's walk of the game's
+/// structures never looks, so they were not rewound with everything else and
+/// each machine's copy drifted by however much it had re-simulated. 4PSoku now
+/// gathers all of it into one block and exports its location.
+///
+/// Cached once found: the module is never unloaded, and this is asked on every
+/// dump, which during a rollback is several times a frame.
+pub unsafe fn four_player_rollback_state() -> Option<(usize, usize)> {
+    static mut CACHED: Option<(usize, usize)> = None;
+    static mut WARNED: bool = false;
+
+    if let Some(found) = CACHED {
+        return Some(found);
+    }
+    if !four_player_mod_loaded() {
+        return None;
+    }
+    let module = GetModuleHandleA(windows::core::s!("4PSoku.dll")).ok()?;
+    let Some(proc) = GetProcAddress(module, windows::core::s!("FourPSokuRollbackState")) else {
+        // Not a crash and not silent: this pairing plays, and then desyncs
+        // the first time someone is healed, which is far harder to trace
+        // back to a version mismatch than a message at match start.
+        if !WARNED {
+            WARNED = true;
+            println!(
+                "giuroll: WARNING 4PSoku.dll does not export its rollback state -- it \
+                 is older than this giuroll. 2v2 netplay WILL desync. Update 4PSoku.dll."
+            );
+        }
+        return None;
+    };
+    let get: extern "C" fn(*mut usize) -> usize = std::mem::transmute(proc);
+    let mut size = 0usize;
+    let address = get(&mut size);
+    // Small by design; anything else is not the block this code knows.
+    if address == 0 || size == 0 || size > 4096 {
+        return None;
+    }
+    CACHED = Some((address, size));
+    Some((address, size))
+}
+
 /// 4PSoku's P3/P4, or None when this is an ordinary 1v1.
 ///
 /// The mod puts them in the battle manager's own CharacterManager* array: it

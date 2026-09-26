@@ -296,7 +296,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-8";
+const FOURP_BUILD: &str = "4p-test-9";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
@@ -452,6 +452,14 @@ fn initialize(dllmodule: HMODULE, pretend_to_be_vanilla: bool) -> bool {
 }
 //687040 true real input buffer manipulation
 // 85b8ec some related varible, 487040
+/// Tells 4PSoku this giuroll saves and restores the mod's own simulation state
+/// (4PSoku's FourPSokuRollbackState). A giuroll without it plays a 2v2 fine
+/// until the first heal, then desyncs; 4PSoku looks for this export and warns.
+#[no_mangle]
+pub extern "C" fn GiurollSavesFourPlayerState() -> bool {
+    true
+}
+
 #[no_mangle]
 pub extern "cdecl" fn CheckVersion(a: *const [u8; 16]) -> bool {
     const HASH110A: [u8; 16] = [
