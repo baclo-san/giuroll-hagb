@@ -61,6 +61,10 @@ const PUNCH_INTERVAL: Duration = Duration::from_millis(100);
 /// would just be noise on a link that is never going to open.
 const PUNCH_GIVE_UP: Duration = Duration::from_secs(10);
 
+/// How recently a peer must have been heard on its direct path for that path
+/// to count as reaching it. See send_to_peers.
+const DIRECT_LIVE_WINDOW: Duration = Duration::from_millis(1500);
+
 #[derive(Clone, Copy)]
 pub struct PeerLink {
     /// Where the relay says this peer is.
@@ -73,6 +77,9 @@ pub struct PeerLink {
     /// view is the classic way to build a hole punch that works on the
     /// developer's LAN and nowhere else.
     confirmed: Option<[u8; 16]>,
+    /// When anything last ARRIVED from `confirmed`. A punch proves a path
+    /// existed once; only traffic proves it still does.
+    last_heard: Option<Instant>,
     last_probe: Option<Instant>,
     /// When we last answered this peer, so a burst of probes cannot become a
     /// burst of replies even if the kind byte is ever wrong again.
@@ -91,6 +98,7 @@ impl PeerLink {
         Self {
             told: None,
             confirmed: None,
+            last_heard: None,
             last_probe: None,
             last_reply: None,
             first_probe: None,
@@ -184,6 +192,24 @@ fn describe(addr: &[u8; 16]) -> String {
     )
 }
 
+/// Something arrived. If it came from a peer's direct address, that path is
+/// alive. Compares family, port and address only; the rest of a sockaddr_in
+/// is padding and need not match.
+pub unsafe fn note_heard(from: *const SOCKADDR) {
+    if !ENABLED || from.is_null() {
+        return;
+    }
+    let src = std::slice::from_raw_parts(from as *const u8, 8);
+    for slot in 0..MAX_PLAYERS {
+        if let Some(addr) = PEERS[slot].confirmed {
+            if addr[0..8] == *src {
+                PEERS[slot].last_heard = Some(Instant::now());
+                return;
+            }
+        }
+    }
+}
+
 /// The relay has told us where everyone is.
 pub unsafe fn handle_peer_list(data: &[u8]) {
     if !ENABLED || data.len() < 2 {
@@ -207,6 +233,11 @@ pub unsafe fn handle_peer_list(data: &[u8]) {
         if unreachable_from_here(ip) {
             if !PEERS[slot].skipped {
                 PEERS[slot].skipped = true;
+                // Whatever this slot was before -- possibly another player,
+                // possibly this one on another machine -- is not where it is
+                // now. A direct path kept from then would swallow every input.
+                PEERS[slot].told = None;
+                PEERS[slot].confirmed = None;
                 println!(
                     "giuroll mesh: peer {} is reported at {}.{}.{}.{}, which cannot be reached \
                      from here -- not probing it, that pair stays on the relay",
@@ -218,6 +249,27 @@ pub unsafe fn handle_peer_list(data: &[u8]) {
 
         let addr = sockaddr_in(ip, port);
         if PEERS[slot].told != Some(addr) {
+            // A NEW address for this slot means a new socket: the player
+            // reconnected, or someone else took the seat. Any direct path
+            // proven before belongs to the old one and must go with it.
+            //
+            // Keeping it was a live deadlock (2026-09-27). A player rejoined
+            // from a new port; the others still counted the old punched path
+            // as confirmed, sent every input to a port nobody was listening
+            // on, and never fell back to the relay because a confirmed path
+            // is exactly what stops that. He received nothing from them, they
+            // stalled waiting for him, and the match froze at frame 9 with
+            // every machine reporting "3 of 3 peers direct".
+            if PEERS[slot].confirmed.is_some() {
+                println!(
+                    "giuroll mesh: peer {} moved to {} -- dropping the direct path to its old address",
+                    slot,
+                    describe(&addr)
+                );
+            }
+            PEERS[slot].confirmed = None;
+            PEERS[slot].last_heard = None;
+            PEERS[slot].skipped = false;
             PEERS[slot].told = Some(addr);
             PEERS[slot].first_probe = None;
             PEERS[slot].last_probe = None;
@@ -268,6 +320,7 @@ pub unsafe fn handle_punch(data: &[u8], from: *const SOCKADDR) {
 
     if PEERS[slot].confirmed != Some(addr) {
         PEERS[slot].confirmed = Some(addr);
+        PEERS[slot].last_heard = Some(Instant::now());
         println!(
             "giuroll mesh: direct path to peer {} via {} ({} of {} peers direct)",
             slot,
@@ -429,7 +482,19 @@ pub unsafe fn send_to_peers(data: &[u8]) -> bool {
             // so there is no latency to lose. If it does not work, this is
             // the difference between a playable match and a peer starved of
             // input with no fallback left.
-            if !PEERS[slot].skipped {
+            //
+            // Nor does a peer we have not HEARD from on that path lately.
+            // A confirmed path is only a memory of a punch that worked; a
+            // reconnect to a new port, or a router quietly expiring the
+            // mapping mid-match, leaves it pointing at nothing, and without
+            // this we would keep feeding the void and never send the relay
+            // copy (the frame-9 deadlock of 2026-09-27). Stale means: send
+            // direct AND via the relay, until the peer's own traffic shows
+            // the path is alive again.
+            let live = PEERS[slot]
+                .last_heard
+                .is_some_and(|t| t.elapsed() < DIRECT_LIVE_WINDOW);
+            if !PEERS[slot].skipped && live {
                 reached += 1;
             }
         }

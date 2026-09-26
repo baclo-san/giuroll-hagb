@@ -491,6 +491,13 @@ impl Netcoder {
 
                 let differ = if comparable_regions {
                     ours.unwrap()[..] != packet.region_hashes[..]
+                } else if rollbacker.players() > 2 {
+                    // A 4P peer sends checksums for every frame it has
+                    // retired, so none means it has not retired this one yet
+                    // and its weather byte is a zero placeholder, not a value.
+                    // Comparing against it lit DESYNC at frame 0 against all
+                    // three peers the moment a match started (2026-09-27).
+                    false
                 } else if let Some(weather_local) = rollbacker.weathers.get(&frame) {
                     // Only when we hold a real value for that frame.
                     // Defaulting a missing one to zero made every match

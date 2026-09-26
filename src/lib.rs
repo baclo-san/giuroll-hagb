@@ -296,7 +296,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-9";
+const FOURP_BUILD: &str = "4p-test-10";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
@@ -3032,6 +3032,11 @@ unsafe extern "cdecl" fn readonlinedata(a: *mut ilhook::x86::Registers, _b: usiz
         swallow(a, slic);
     } else if type1 > 0x6c && type1 <= 0x80 {
         swallow(a, slic);
+    }
+
+    // Any packet from a peer's direct address proves that path still works.
+    if len > 0 {
+        mesh::note_heard(((*a).esp + 0x44) as *const windows::Win32::Networking::WinSock::SOCKADDR);
     }
 
     // Driven from here rather than from the frame hook because punching has to
