@@ -958,7 +958,23 @@ unsafe fn report_regions(
         if ours[i] == theirs[i] {
             continue;
         }
-        if i >= REGION_NAMES.len() - 2 {
+        if (12..16).contains(&i) {
+            let cards = |w: u32| -> String {
+                (0..4)
+                    .map(|k| (w >> (k * 8)) & 0xFF)
+                    .filter(|c| *c != 0xFF)
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            println!(
+                "    {:<20} local [{}]  slot {} [{}]",
+                name,
+                cards(ours[i]),
+                slot,
+                cards(theirs[i])
+            );
+        } else if i >= REGION_NAMES.len() - 2 {
             // Which buttons, for which two players. An input line here
             // means the machines never agreed on what was pressed, and
             // nothing about the simulation is worth reading until that is

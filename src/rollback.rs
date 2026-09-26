@@ -426,7 +426,7 @@ pub static mut MEMORY_LEAK: usize = 0;
 /// how much health it has. They are what the simulation is FOR, they are
 /// identical on two machines in sync, and when they are not, the numbers
 /// themselves say what went wrong rather than merely that something did.
-pub const REGION_NAMES: [&str; 14] = [
+pub const REGION_NAMES: [&str; 18] = [
     "player 1 pos x",
     "player 1 pos y",
     "player 1 action/hp",
@@ -439,6 +439,19 @@ pub const REGION_NAMES: [&str; 14] = [
     "player 4 pos x",
     "player 4 pos y",
     "player 4 action/hp",
+    // The first four cards in each player's hand, one byte per card id.
+    //
+    // Same inputs, different move: a live 4P session (2026-09-27) had every
+    // machine agree on every button yet report three different actions for
+    // one character the moment its player used a card -- 505, 570 and 602 --
+    // while position and HP still matched. That is what different HANDS look
+    // like: the same "use card" press plays whatever card that machine thinks
+    // is on top. Comparing the hands directly shows it on the frame the cards
+    // are drawn instead of the frame one is played, and says whose deck.
+    "player 1 hand",
+    "player 2 hand",
+    "player 3 hand",
+    "player 4 hand",
     // The inputs the frame was simulated with, not state produced by it.
     //
     // Every desync report so far compared only STATE, which says the
@@ -1096,6 +1109,28 @@ pub unsafe fn dump_frame(
         let action = *ptr_wrap!((p + 0x13c) as *const u16) as u32;
         let hp = *ptr_wrap!((p + 0x184) as *const u16) as u32;
         region_hashes[n * 3 + 2] = (action << 16) | hp;
+
+        // Hand: CharacterManager+0x5E8 is a ring of Card* (base +0x5EC,
+        // capacity +0x5F0, first index +0x5F4, count +0x5F8). Card ids are
+        // below 256, so four fit in a word, first card in the low byte;
+        // 0xFF marks an empty position. Every read is bounds-checked: this
+        // runs on every dumped frame and must never be the thing that faults.
+        let mut hand = 0xFFFF_FFFFu32;
+        let base = *ptr_wrap!((p + 0x5ec) as *const usize);
+        let cap = *ptr_wrap!((p + 0x5f0) as *const u32) as usize;
+        let first = *ptr_wrap!((p + 0x5f4) as *const u32) as usize;
+        let count = *ptr_wrap!((p + 0x5f8) as *const u32) as usize;
+        if (0x00400000..0x7fff0000).contains(&base) && cap > 0 && cap <= 16 && count <= cap {
+            for k in 0..count.min(4) {
+                let card = *ptr_wrap!((base + ((first + k) % cap) * 4) as *const usize);
+                if !(0x00400000..0x7fff0000).contains(&card) {
+                    continue;
+                }
+                let id = *ptr_wrap!(card as *const u16) as u32;
+                hand = (hand & !(0xFF << (k * 8))) | ((id & 0xFF) << (k * 8));
+            }
+        }
+        region_hashes[12 + n] = hand;
     }
 
     LAST_M_LEN = m.len();
