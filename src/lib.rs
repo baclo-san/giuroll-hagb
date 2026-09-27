@@ -296,7 +296,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-11";
+const FOURP_BUILD: &str = "4p-test-12";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
@@ -485,6 +485,12 @@ const MAX_INJECTED_PLAYERS: usize = 4;
 static mut REAL_INPUTS: [Option<[bool; INPUT_KEYS_NUMBERS]>; MAX_INJECTED_PLAYERS] =
     [None; MAX_INJECTED_PLAYERS];
 static mut REAL_INPUT_CURSOR: usize = 0;
+/// This frame's inputs as queued, kept after REAL_INPUTS is drained: what a
+/// repeated poll of the same player is fed. See next_injected_input.
+static mut FED_INPUTS: [Option<[bool; INPUT_KEYS_NUMBERS]>; MAX_INJECTED_PLAYERS] =
+    [None; MAX_INJECTED_PLAYERS];
+static mut REPEAT_POLL_REPORTS: usize = 0;
+static mut UNROUTED_POLL_REPORTS: usize = 0;
 
 /// The KeymapManager each slot polls through, rebuilt every simulated
 /// frame.
@@ -580,8 +586,40 @@ unsafe fn next_injected_input(input_manager: usize) -> Option<[bool; INPUT_KEYS_
 
     // By identity wherever the engine will say who is asking.
     if SLOT_MANAGERS_VALID {
-        let slot = SLOT_MANAGERS.iter().position(|m| *m == input_manager)?;
-        return REAL_INPUTS[slot].take();
+        let Some(slot) = SLOT_MANAGERS.iter().position(|m| *m == input_manager) else {
+            // Not any player's manager, so the device read that follows
+            // cannot reach a character. Said, in case that is ever wrong.
+            if UNROUTED_POLL_REPORTS < 3 {
+                UNROUTED_POLL_REPORTS += 1;
+                println!(
+                    "giuroll 4P: input poll for manager {:#x}, which is no player's ({:x?}) -- left to the device",
+                    input_manager, SLOT_MANAGERS
+                );
+            }
+            return None;
+        };
+        return match REAL_INPUTS[slot].take() {
+            Some(x) => Some(x),
+            // A SECOND poll of one player's manager in the same frame. Letting
+            // it through to the device, as this used to, reads whatever that
+            // machine's own controller holds right now: real buttons on the
+            // one machine where this player sits, nothing everywhere else. So
+            // only that machine's copy of the player changes -- and during a
+            // rollback it reads today's buttons into a past frame. Both live
+            // desyncs of 2026-09-28 had exactly that shape: the one machine
+            // out of step was, each time, the diverging character's own.
+            // Feeding the frame's input again is the same on every machine.
+            None => {
+                if REPEAT_POLL_REPORTS < 3 {
+                    REPEAT_POLL_REPORTS += 1;
+                    println!(
+                        "giuroll 4P: player {} polled twice in one frame -- fed its frame input again, not the device",
+                        slot + 1
+                    );
+                }
+                FED_INPUTS[slot]
+            }
+        };
     }
 
     // Character select, menus, replays, anything before the battle manager
@@ -2494,6 +2532,7 @@ unsafe fn set_input_buffers_opt(inputs: &[Option<[bool; INPUT_KEYS_NUMBERS]>]) {
     for (slot, i) in inputs.iter().enumerate() {
         REAL_INPUTS[slot] = *i;
     }
+    FED_INPUTS = REAL_INPUTS;
     REAL_INPUT_CURSOR = 0;
     INJECT_POLLS = 0;
     // Once per simulated frame, immediately before the polls it routes.
