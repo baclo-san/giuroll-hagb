@@ -974,6 +974,28 @@ unsafe fn report_regions(
                 slot,
                 cards(theirs[i])
             );
+        } else if (16..20).contains(&i) {
+            let held = |w: u32| -> String {
+                let s4 = |v: u32| (((v & 0xF) as i32) << 28 >> 28).to_string();
+                let names = ["A", "B", "C", "D", "ch", "sc"];
+                let mut out = format!("lr {} ud {}", s4(w), s4(w >> 4));
+                for (b, n) in names.iter().enumerate() {
+                    out += &format!(" {} {}", n, (w >> (8 + b * 4)) & 0xF);
+                }
+                out
+            };
+            println!(
+                "    {:<20} local [{}]  slot {} [{}]",
+                name,
+                held(ours[i]),
+                slot,
+                held(theirs[i])
+            );
+        } else if (20..24).contains(&i) {
+            println!(
+                "    {:<20} local {}  slot {} {}",
+                name, ours[i], slot, theirs[i]
+            );
         } else if i >= REGION_NAMES.len() - 2 {
             // Which buttons, for which two players. An input line here
             // means the machines never agreed on what was pressed, and

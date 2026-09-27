@@ -426,7 +426,7 @@ pub static mut MEMORY_LEAK: usize = 0;
 /// how much health it has. They are what the simulation is FOR, they are
 /// identical on two machines in sync, and when they are not, the numbers
 /// themselves say what went wrong rather than merely that something did.
-pub const REGION_NAMES: [&str; 18] = [
+pub const REGION_NAMES: [&str; 26] = [
     "player 1 pos x",
     "player 1 pos y",
     "player 1 action/hp",
@@ -452,6 +452,27 @@ pub const REGION_NAMES: [&str; 18] = [
     "player 2 hand",
     "player 3 hand",
     "player 4 hand",
+    // How long each direction and button has been held, as the engine sees
+    // it -- the KeymapManager counters moves are decided from.
+    //
+    // Three live desyncs (2026-09-28) had one shape: one machine disagreed
+    // with the other three about ITS OWN player, who was attacking on that
+    // machine and getting hit on the rest, with identical inputs everywhere.
+    // The local sync test, which replays wrong inputs and restores, passes
+    // with the same characters. So something differs between a machine that
+    // runs a player's frames once and machines that replay them, online only.
+    // These say whether the input HISTORY is what differs.
+    "player 1 held",
+    "player 2 held",
+    "player 3 held",
+    "player 4 held",
+    // How many objects (projectiles, effects with hitboxes) each player owns.
+    // An attack that exists on one machine and not another is the usual way
+    // a hit lands on some screens only.
+    "player 1 objects",
+    "player 2 objects",
+    "player 3 objects",
+    "player 4 objects",
     // The inputs the frame was simulated with, not state produced by it.
     //
     // Every desync report so far compared only STATE, which says the
@@ -1131,6 +1152,31 @@ pub unsafe fn dump_frame(
             }
         }
         region_hashes[12 + n] = hand;
+
+        // Held counters, 4 bits each so all of them fit one word: left/right
+        // and up/down as signed -8..7, then A B C D change spellcard as 0..15.
+        // Saturated, because what decides moves is short holds and taps; a
+        // difference in a long hold shows up anyway as a saturated nibble.
+        let mut held = 0u32;
+        let key_manager = *ptr_wrap!((p + 0x750) as *const usize);
+        if (0x00400000..0x7fff0000).contains(&key_manager) {
+            let km = *ptr_wrap!(key_manager as *const usize);
+            if (0x00400000..0x7fff0000).contains(&km) {
+                let signed = |v: i32| (v.clamp(-8, 7) as u32) & 0xF;
+                let td = *ptr_wrap!((km + 0x38) as *const i32);
+                let lr = *ptr_wrap!((km + 0x3c) as *const i32);
+                held = signed(lr) | (signed(td) << 4);
+                for b in 0..6usize {
+                    let v = (*ptr_wrap!((km + 0x40 + b * 4) as *const u32)).min(15);
+                    held |= v << (8 + b * 4);
+                }
+            }
+        }
+        region_hashes[16 + n] = held;
+
+        // Object list: an LL3 at +0x17c, its count at +0x180.
+        let objects = *ptr_wrap!((p + 0x180) as *const u32);
+        region_hashes[20 + n] = if objects < 100_000 { objects } else { u32::MAX };
     }
 
     LAST_M_LEN = m.len();
