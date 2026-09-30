@@ -301,7 +301,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-15";
+const FOURP_BUILD: &str = "4p-test-16";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
@@ -3555,7 +3555,7 @@ type Inputs = Vec<[bool; INPUT_KEYS_NUMBERS]>;
 /// is capped at 15 -- and divergence compounds over them, so simulating a
 /// stretch is both the more faithful test and the one that actually exercises
 /// the thing.
-const RUN_FRAMES: usize = 4;
+const RUN_FRAMES: usize = 8;
 
 enum SyncPhase {
     Idle,
@@ -3678,7 +3678,7 @@ unsafe fn handle_sync_test(battle_state: &u32, cur_speed_iter: u32) {
     // you want in the tool that is supposed to be the trustworthy one. A couple
     // hundred frames of leaked allocations is nothing; an unbounded run is a
     // slow death.
-    const MAX_CHECKS: usize = 100;
+    const MAX_CHECKS: usize = 200;
 
     if let Some(st) = SYNC_TEST.as_ref() {
         if st.checked >= MAX_CHECKS {
