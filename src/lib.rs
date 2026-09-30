@@ -176,9 +176,14 @@ macro_rules! println {
         use crate::ENABLE_PRINTLN;
         use crate::replay::CHECK;
         #[allow(unused_unsafe)]
+        // giuroll.log is written whatever enable_println says; only the
+        // console is gated on it. The ini shipped with giuroll sets
+        // enable_println=no, so every player who installed from it wrote no
+        // log at all -- two of four machines in a 2026-09-30 session, and
+        // exactly the two whose view of a desync was needed.
+        crate::log_line(&std::format!($($arg)*));
         if unsafe { ENABLE_PRINTLN } || unsafe { CHECK.is_some() } {
             std::println!($($arg)*);
-            crate::log_line(&std::format!($($arg)*));
         }
     }};
 }
@@ -296,7 +301,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-14";
+const FOURP_BUILD: &str = "4p-test-15";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///

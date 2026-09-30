@@ -489,6 +489,20 @@ impl Netcoder {
                 let comparable_regions = ours.is_some()
                     && packet.region_hashes.len() == crate::rollback::REGION_NAMES.len();
 
+                // A peer whose report has a different shape is running a
+                // different giuroll. That used to be silent on BOTH sides --
+                // neither compared, neither said why -- so a session with one
+                // player left on an old build desynced over and over and
+                // produced not one desync report (2026-09-30). Different
+                // builds can simulate differently, so this is the first thing
+                // to fix, and it is said where every player will see it.
+                if rollbacker.players() > 2
+                    && !packet.region_hashes.is_empty()
+                    && packet.region_hashes.len() != crate::rollback::REGION_NAMES.len()
+                {
+                    unsafe { warn_wrong_build(slot, packet.region_hashes.len()) };
+                }
+
                 let differ = if comparable_regions {
                     ours.unwrap()[..] != packet.region_hashes[..]
                 } else if rollbacker.players() > 2 {
@@ -893,6 +907,34 @@ impl Netcoder {
 /// useful half: "player 3 differs, everything else agrees" points somewhere,
 /// and so does "everything differs", which means the divergence is older than
 /// this frame and the report has arrived too late to localise anything.
+/// Once per peer per session: that peer runs a different giuroll build.
+unsafe fn warn_wrong_build(slot: usize, their_regions: usize) {
+    static mut WARNED: u32 = 0;
+
+    if slot >= 32 || WARNED & (1 << slot) != 0 {
+        return;
+    }
+    WARNED |= 1 << slot;
+    println!(
+        "WRONG GIUROLL BUILD: peer slot {} sends {} region checksums, this build ({}) sends {}. \
+         Different builds can desync and cannot report desyncs to each other. \
+         Everyone must run the same giuroll.",
+        slot,
+        their_regions,
+        crate::FOURP_BUILD,
+        crate::rollback::REGION_NAMES.len()
+    );
+    let text = format!(
+        "Player {} is running a different giuroll build than you ({}).\n\n\
+         Different builds can desync, and desyncs between them are not reported.\n\
+         Everyone in the match must use the same giuroll.",
+        slot + 1,
+        crate::FOURP_BUILD
+    );
+    // On its own thread: the match keeps running behind the box.
+    std::thread::spawn(move || crate::warning_box(&text, "giuroll: build mismatch"));
+}
+
 unsafe fn report_regions(
     rollbacker: &Rollbacker,
     frame: usize,
