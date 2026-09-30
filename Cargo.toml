@@ -17,6 +17,9 @@ repository = "https://github.com/Hagb/giuroll-hagb"
 crate-type = ["cdylib"]
 
 [features]
+# On by default: the console, and enable_println's default, both hang off
+# it. Two 4P test builds went out without it and silently lost every log.
+default = ["allocconsole"]
 logtofile = ["dep:fern", "dep:humantime", "dep:log"]
 allocconsole = []
 f62 = []
