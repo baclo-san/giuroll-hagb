@@ -302,7 +302,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-17";
+const FOURP_BUILD: &str = "4p-test-18";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
@@ -496,6 +496,21 @@ static mut REAL_INPUT_CURSOR: usize = 0;
 static mut FED_INPUTS: [Option<[bool; INPUT_KEYS_NUMBERS]>; MAX_INJECTED_PLAYERS] =
     [None; MAX_INJECTED_PLAYERS];
 static mut REPEAT_POLL_REPORTS: usize = 0;
+
+/// Which pass of the battle frame loop this is; main_hook bumps it at the top
+/// of every pass, before anything queues input for that pass.
+static mut FRAME_PASS: u64 = 0;
+/// The pass the current REAL_INPUTS were queued for.
+///
+/// Injected input is valid only during the pass it was queued in. Nothing
+/// used to say so: a queue -- and the seat mapping that routes it -- stayed
+/// live until the next queue replaced it, and replay playback, local versus
+/// and the game's own replay reading queue nothing. So a replay watched after
+/// an online match routed P1/P2's polls through that match's stale mapping,
+/// and test-12's repeat-poll path fed them its last input every frame instead
+/// of letting the game read the replay: P1/P2 stood still for the whole
+/// replay (2026-10-12).
+static mut QUEUED_PASS: u64 = u64::MAX;
 static mut UNROUTED_POLL_REPORTS: usize = 0;
 
 /// The KeymapManager each slot polls through, rebuilt every simulated
@@ -589,6 +604,12 @@ static mut POLL_HISTORY: [(usize, i32, i32, u32); MAX_INJECTED_PLAYERS] =
 /// -- which is the signal to let the real hardware poll happen.
 unsafe fn next_injected_input(input_manager: usize) -> Option<[bool; INPUT_KEYS_NUMBERS]> {
     INJECT_POLLS += 1;
+
+    // Nothing queued for this pass: the engine's own input read is the right
+    // one (a replay's stream, a local controller).
+    if QUEUED_PASS != FRAME_PASS {
+        return None;
+    }
 
     // By identity wherever the engine will say who is asking.
     if SLOT_MANAGERS_VALID {
@@ -2540,6 +2561,7 @@ unsafe fn set_input_buffers_opt(inputs: &[Option<[bool; INPUT_KEYS_NUMBERS]>]) {
         REAL_INPUTS[slot] = *i;
     }
     FED_INPUTS = REAL_INPUTS;
+    QUEUED_PASS = FRAME_PASS;
     REAL_INPUT_CURSOR = 0;
     INJECT_POLLS = 0;
     // Once per simulated frame, immediately before the polls it routes.
@@ -4384,6 +4406,8 @@ unsafe extern "cdecl" fn main_hook(a: *mut ilhook::x86::Registers, _b: usize) {
     //REQUESTED_THREAD_ID.store(0, Relaxed);
 
     let framecount = *SOKU_FRAMECOUNT;
+    // A new pass of the frame loop; see QUEUED_PASS.
+    FRAME_PASS = FRAME_PASS.wrapping_add(1);
 
     let state_sub_count: &mut u32;
     let battle_state: &mut u32;
