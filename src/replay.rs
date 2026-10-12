@@ -1115,6 +1115,16 @@ pub unsafe fn handle_replay(
 
     let framecount = *SOKU_FRAMECOUNT;
 
+    // Playback record, for compare_records.py. Frame 1 is the first frame of
+    // a replayed match; rewinding writes frames again, and the comparison
+    // keeps the last word on each, which is identical anyway.
+    if CHECK.is_none() && PERFORMANCE_TEST.is_none() {
+        if framecount == 1 && *cur_speed_iter == 0 {
+            crate::record::start_playback();
+        }
+        crate::record::playback_frame(framecount);
+    }
+
     if framecount == 1
         || framecount == 2
         || framecount % 16 == 1

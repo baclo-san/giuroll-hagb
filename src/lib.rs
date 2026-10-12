@@ -30,6 +30,7 @@ use std::{
 mod mesh;
 mod netcode;
 mod peers;
+mod record;
 mod replay;
 mod rollback;
 mod sound;
@@ -301,7 +302,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-16";
+const FOURP_BUILD: &str = "4p-test-17";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
@@ -982,6 +983,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
     if let Ok(mut path) = LOG_PATH.lock() {
         let mut p = filename.clone();
 
+        unsafe { record::DIR = Some(p.clone()) };
         p.push("giuroll.log");
         *path = Some(p);
     }
@@ -4089,6 +4091,8 @@ unsafe fn handle_online(
             None => (2, if is_p1() { 0 } else { 1 }),
         };
         println!("giuroll: {} players, we are slot {}", players, local_slot);
+        // A new match: finish any previous record and, for 4P, start this one.
+        unsafe { record::start(players, local_slot) };
         // Compare this line between players before reading anything else in
         // a desync report. Two machines running different precision cannot
         // stay in sync no matter how correct the netcode is.

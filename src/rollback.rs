@@ -240,6 +240,8 @@ impl Rollbacker {
             region_hashes[n - 2] = pack_input_pair(&m.inputs, 0);
             region_hashes[n - 1] = pack_input_pair(&m.inputs, 2);
             self.region_hashes.insert(m.prev_state.number, region_hashes);
+            // Confirmed: this is the frame as it will stand on every machine.
+            unsafe { crate::record::frame(m.prev_state.number, &m.inputs, &region_hashes) };
             m.prev_state.did_happen();
             #[cfg(feature = "logrollback")]
             println!("did_happen {}", m.prev_state.number);
@@ -503,6 +505,75 @@ fn pack_input_pair(inputs: &[RInput], first: usize) -> u32 {
         }
     };
     (mask(first) << 16) | mask(first + 1)
+}
+
+/// The REGION_NAMES values for the current game state, input slots left zero
+/// (the rollbacker fills those when it retires the frame).
+pub unsafe fn region_values() -> [u32; REGION_NAMES.len()] {
+    compute_regions(*(0x8985E4 as *const usize))
+}
+
+unsafe fn compute_regions(p_battle_manager: usize) -> [u32; REGION_NAMES.len()] {
+    let mut region_hashes = [0u32; REGION_NAMES.len()];
+    for n in 0..4usize {
+        let p = *ptr_wrap!((p_battle_manager + 0xc + n * 4) as *const usize);
+        if !(0x00400000..0x7fff0000).contains(&p) {
+            continue;
+        }
+        region_hashes[n * 3] = *ptr_wrap!((p + 0xec) as *const u32);
+        region_hashes[n * 3 + 1] = *ptr_wrap!((p + 0xf0) as *const u32);
+        let action = *ptr_wrap!((p + 0x13c) as *const u16) as u32;
+        let hp = *ptr_wrap!((p + 0x184) as *const u16) as u32;
+        region_hashes[n * 3 + 2] = (action << 16) | hp;
+
+        // Hand: CharacterManager+0x5E8 is a ring of Card* (base +0x5EC,
+        // capacity +0x5F0, first index +0x5F4, count +0x5F8). Card ids are
+        // below 256, so four fit in a word, first card in the low byte;
+        // 0xFF marks an empty position. Every read is bounds-checked: this
+        // runs on every dumped frame and must never be the thing that faults.
+        let mut hand = 0xFFFF_FFFFu32;
+        let base = *ptr_wrap!((p + 0x5ec) as *const usize);
+        let cap = *ptr_wrap!((p + 0x5f0) as *const u32) as usize;
+        let first = *ptr_wrap!((p + 0x5f4) as *const u32) as usize;
+        let count = *ptr_wrap!((p + 0x5f8) as *const u32) as usize;
+        if (0x00400000..0x7fff0000).contains(&base) && cap > 0 && cap <= 16 && count <= cap {
+            for k in 0..count.min(4) {
+                let card = *ptr_wrap!((base + ((first + k) % cap) * 4) as *const usize);
+                if !(0x00400000..0x7fff0000).contains(&card) {
+                    continue;
+                }
+                let id = *ptr_wrap!(card as *const u16) as u32;
+                hand = (hand & !(0xFF << (k * 8))) | ((id & 0xFF) << (k * 8));
+            }
+        }
+        region_hashes[12 + n] = hand;
+
+        // Held counters, 4 bits each so all of them fit one word: left/right
+        // and up/down as signed -8..7, then A B C D change spellcard as 0..15.
+        // Saturated, because what decides moves is short holds and taps; a
+        // difference in a long hold shows up anyway as a saturated nibble.
+        let mut held = 0u32;
+        let key_manager = *ptr_wrap!((p + 0x750) as *const usize);
+        if (0x00400000..0x7fff0000).contains(&key_manager) {
+            let km = *ptr_wrap!(key_manager as *const usize);
+            if (0x00400000..0x7fff0000).contains(&km) {
+                let signed = |v: i32| (v.clamp(-8, 7) as u32) & 0xF;
+                let td = *ptr_wrap!((km + 0x38) as *const i32);
+                let lr = *ptr_wrap!((km + 0x3c) as *const i32);
+                held = signed(lr) | (signed(td) << 4);
+                for b in 0..6usize {
+                    let v = (*ptr_wrap!((km + 0x40 + b * 4) as *const u32)).min(15);
+                    held |= v << (8 + b * 4);
+                }
+            }
+        }
+        region_hashes[16 + n] = held;
+
+        // Object list: an LL3 at +0x17c, its count at +0x180.
+        let objects = *ptr_wrap!((p + 0x180) as *const u32);
+        region_hashes[20 + n] = if objects < 100_000 { objects } else { u32::MAX };
+    }
+    region_hashes
 }
 
 pub unsafe fn dump_frame(
@@ -1119,65 +1190,7 @@ pub unsafe fn dump_frame(
     // +0x13c starting with actionId, HP at +0x184. Floats travel as their
     // bits, so two machines in sync compare equal and one that has drifted
     // by a fraction of a pixel still shows up.
-    let mut region_hashes = [0u32; REGION_NAMES.len()];
-    for n in 0..4usize {
-        let p = *ptr_wrap!((p_battle_manager + 0xc + n * 4) as *const usize);
-        if !(0x00400000..0x7fff0000).contains(&p) {
-            continue;
-        }
-        region_hashes[n * 3] = *ptr_wrap!((p + 0xec) as *const u32);
-        region_hashes[n * 3 + 1] = *ptr_wrap!((p + 0xf0) as *const u32);
-        let action = *ptr_wrap!((p + 0x13c) as *const u16) as u32;
-        let hp = *ptr_wrap!((p + 0x184) as *const u16) as u32;
-        region_hashes[n * 3 + 2] = (action << 16) | hp;
-
-        // Hand: CharacterManager+0x5E8 is a ring of Card* (base +0x5EC,
-        // capacity +0x5F0, first index +0x5F4, count +0x5F8). Card ids are
-        // below 256, so four fit in a word, first card in the low byte;
-        // 0xFF marks an empty position. Every read is bounds-checked: this
-        // runs on every dumped frame and must never be the thing that faults.
-        let mut hand = 0xFFFF_FFFFu32;
-        let base = *ptr_wrap!((p + 0x5ec) as *const usize);
-        let cap = *ptr_wrap!((p + 0x5f0) as *const u32) as usize;
-        let first = *ptr_wrap!((p + 0x5f4) as *const u32) as usize;
-        let count = *ptr_wrap!((p + 0x5f8) as *const u32) as usize;
-        if (0x00400000..0x7fff0000).contains(&base) && cap > 0 && cap <= 16 && count <= cap {
-            for k in 0..count.min(4) {
-                let card = *ptr_wrap!((base + ((first + k) % cap) * 4) as *const usize);
-                if !(0x00400000..0x7fff0000).contains(&card) {
-                    continue;
-                }
-                let id = *ptr_wrap!(card as *const u16) as u32;
-                hand = (hand & !(0xFF << (k * 8))) | ((id & 0xFF) << (k * 8));
-            }
-        }
-        region_hashes[12 + n] = hand;
-
-        // Held counters, 4 bits each so all of them fit one word: left/right
-        // and up/down as signed -8..7, then A B C D change spellcard as 0..15.
-        // Saturated, because what decides moves is short holds and taps; a
-        // difference in a long hold shows up anyway as a saturated nibble.
-        let mut held = 0u32;
-        let key_manager = *ptr_wrap!((p + 0x750) as *const usize);
-        if (0x00400000..0x7fff0000).contains(&key_manager) {
-            let km = *ptr_wrap!(key_manager as *const usize);
-            if (0x00400000..0x7fff0000).contains(&km) {
-                let signed = |v: i32| (v.clamp(-8, 7) as u32) & 0xF;
-                let td = *ptr_wrap!((km + 0x38) as *const i32);
-                let lr = *ptr_wrap!((km + 0x3c) as *const i32);
-                held = signed(lr) | (signed(td) << 4);
-                for b in 0..6usize {
-                    let v = (*ptr_wrap!((km + 0x40 + b * 4) as *const u32)).min(15);
-                    held |= v << (8 + b * 4);
-                }
-            }
-        }
-        region_hashes[16 + n] = held;
-
-        // Object list: an LL3 at +0x17c, its count at +0x180.
-        let objects = *ptr_wrap!((p + 0x180) as *const u32);
-        region_hashes[20 + n] = if objects < 100_000 { objects } else { u32::MAX };
-    }
+    let region_hashes = compute_regions(p_battle_manager);
 
     LAST_M_LEN = m.len();
 
