@@ -20,16 +20,32 @@ import struct
 import sys
 from collections import defaultdict
 
-# Must match giuroll's rollback::REGION_NAMES (26 entries in 4p-test-13+).
-REGION_NAMES = (
+# Must match giuroll's rollback::REGION_NAMES. 26 entries in 4p-test-13..18,
+# whose "objects" value was always 0 (it read the wrong list); 30 from test-19.
+_BASE = (
     [f"player {p} {what}" for p in range(1, 5) for what in ("pos x", "pos y", "action/hp")]
     + [f"player {p} hand" for p in range(1, 5)]
     + [f"player {p} held" for p in range(1, 5)]
     + [f"player {p} objects" for p in range(1, 5)]
-    + ["inputs p1+p2", "inputs p3+p4"]
 )
+NAMES_BY_COUNT = {
+    26: _BASE + ["inputs p1+p2", "inputs p3+p4"],
+    30: _BASE + [f"player {p} hit state" for p in range(1, 5)] + ["inputs p1+p2", "inputs p3+p4"],
+}
+REGION_NAMES = NAMES_BY_COUNT[30]
 HEADER = struct.Struct("<4sBBBBIQ16s")
 PLAYBACK = 0xFF  # seat byte of a record made by playing a replay back
+CHARACTERS = [
+    "Reimu", "Marisa", "Sakuya", "Alice", "Patchouli", "Youmu", "Remilia", "Yuyuko",
+    "Yukari", "Suika", "Reisen", "Aya", "Komachi", "Iku", "Tenshi", "Sanae",
+    "Cirno", "Meiling", "Utsuho", "Suwako",
+]
+
+
+def char_name(c):
+    if c == 0xFF:
+        return "-"
+    return CHARACTERS[c] if c < len(CHARACTERS) else f"character {c}"
 
 
 def load(path):
@@ -38,11 +54,15 @@ def load(path):
     if len(data) < HEADER.size:
         raise ValueError("too short")
     magic, players, slot, regions, _, seed, unix, build = HEADER.unpack_from(data)
-    if magic != b"G4R1":
+    if magic not in (b"G4R1", b"G4R2"):
         raise ValueError("not a giuroll match record")
+    off = HEADER.size
+    chars = None
+    if magic == b"G4R2":
+        chars = tuple(data[off:off + 4])
+        off += 4
     rec = struct.Struct("<I4H%dI" % regions)
     frames = {}
-    off = HEADER.size
     while off + rec.size <= len(data):
         v = rec.unpack_from(data, off)
         frames[v[0]] = (v[1:5], v[5:])
@@ -50,12 +70,11 @@ def load(path):
     return {
         "path": path, "players": players, "slot": slot, "regions": regions,
         "seed": seed, "unix": unix, "build": build.rstrip(b"\0").decode(errors="replace"),
-        "frames": frames,
+        "frames": frames, "chars": chars,
     }
 
 
-def fmt_region(i, v):
-    name = REGION_NAMES[i] if i < len(REGION_NAMES) else f"region {i}"
+def fmt_region(i, v, names=REGION_NAMES):
     if i < 12 and i % 3 != 2:
         return struct.unpack("<f", struct.pack("<I", v))[0].__format__(".4f")
     if i < 12:
@@ -69,7 +88,11 @@ def fmt_region(i, v):
         parts += [f"{n} {(v >> (8 + 4 * k)) & 0xF}" for k, n in enumerate(["A", "B", "C", "D", "ch", "sc"])]
         return " ".join(parts)
     if i < 24:
-        return str(v)
+        if len(names) == 26:
+            return str(v)
+        return "unreadable" if v == 0xFFFFFFFF else f"{v >> 24} objects, hash {v & 0xFFFFFF:06x}"
+    if i < len(names) - 2:
+        return f"{v:08x}"
     return f"{v >> 16:04x}/{v & 0xffff:04x}"
 
 
@@ -82,9 +105,17 @@ def compare(recs):
     builds = {r["build"] for r in recs}
     if len(builds) > 1:
         print(f"  DIFFERENT BUILDS: {sorted(builds)} -- fix that before reading anything else")
-    if len({r["regions"] for r in recs}) > 1:
-        print("  different region counts; cannot compare state")
-        return
+    mixed = len({r["regions"] for r in recs}) > 1
+    if mixed:
+        # Positions, actions, hands and held counters mean the same in every
+        # format; compare those. Lets a test-19 playback of a test-17/18
+        # match still say which machines were right.
+        print("  different record formats; comparing the 20 values they share")
+    chars = next((r["chars"] for r in recs if r["chars"]), None)
+    if chars:
+        print("  characters: " + ", ".join(f"P{n + 1} {char_name(c)}" for n, c in enumerate(chars)))
+    names_all = NAMES_BY_COUNT.get(recs[0]["regions"], [f"region {i}" for i in range(recs[0]["regions"])])
+    n_state = 20 if mixed else recs[0]["regions"] - 2
     if has_playback:
         print("  PLAYBACK is this match replayed locally with no rollback: the machines that match it were right")
     missing = sorted(set(range(4)) - {r["slot"] for r in recs})
@@ -112,7 +143,7 @@ def compare(recs):
     for f in common:
         # The playback record knows no inputs, so the two input values are
         # left out whenever it takes part.
-        regs = [r["frames"][f][1][:24] if has_playback else r["frames"][f][1] for r in recs]
+        regs = [r["frames"][f][1][:n_state] if has_playback or mixed else r["frames"][f][1] for r in recs]
         if len(set(regs)) == 1:
             continue
         print(f"  FIRST STATE DIFFERENCE at frame {f}:")
@@ -123,10 +154,9 @@ def compare(recs):
             groups = defaultdict(list)
             for n, v in zip(names, vals):
                 groups[v].append(n)
-            name = REGION_NAMES[i] if i < len(REGION_NAMES) else f"region {i}"
-            print(f"    {name}:")
+            print(f"    {names_all[i]}:")
             for v, who in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-                print(f"      {fmt_region(i, v):<40} {', '.join(who)}")
+                print(f"      {fmt_region(i, v, names_all):<40} {', '.join(who)}")
         # Context: the same values a few frames earlier, to see what led in.
         before = [x for x in common if x < f][-3:]
         if before:

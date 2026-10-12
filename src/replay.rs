@@ -517,7 +517,17 @@ pub(crate) struct CheckData {
     /// sides of every comparison, so 2P checking behaves exactly as before.
     assists: Option<(PlayerData, PlayerData)>,
     battle_state: u32,
+    /// The state values online desync detection compares (every REGION_NAMES
+    /// entry but the two input words, which are not state).
+    ///
+    /// The fields above are physics and HP only. A projectile restored one
+    /// frame off, or with its hit count wrong, changes none of them until it
+    /// hits someone -- usually after the test's few frames have run -- so the
+    /// test passed while online play desynced on exactly that (2026-10-12).
+    regions: [u32; STATE_REGIONS],
 }
+
+const STATE_REGIONS: usize = crate::rollback::REGION_NAMES.len() - 2;
 
 impl CheckData {
     /// True when this snapshot actually carries P3/P4. A sync test that
@@ -546,6 +556,11 @@ impl CheckData {
         if self.battle_state != other.battle_state {
             out.push("battle_state".to_string());
         }
+        for (i, name) in crate::rollback::REGION_NAMES[..STATE_REGIONS].iter().enumerate() {
+            if self.regions[i] != other.regions[i] {
+                out.push(name.to_string());
+            }
+        }
         out
     }
 
@@ -556,6 +571,9 @@ impl CheckData {
             p2_data: PlayerData::from_player(*(p_battle_manager.offset(0x10) as *const _)),
             assists: four_player_assists(p_battle_manager),
             battle_state: *(p_battle_manager.offset(0x88) as *const u32),
+            regions: crate::rollback::region_values()[..STATE_REGIONS]
+                .try_into()
+                .unwrap(),
         }
     }
 }

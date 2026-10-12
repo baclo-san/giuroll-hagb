@@ -1034,8 +1034,23 @@ unsafe fn report_regions(
                 held(theirs[i])
             );
         } else if (20..24).contains(&i) {
+            let objects = |w: u32| -> String {
+                if w == u32::MAX {
+                    "unreadable".to_string()
+                } else {
+                    format!("{} objects, hash {:06x}", w >> 24, w & 0xff_ffff)
+                }
+            };
             println!(
                 "    {:<20} local {}  slot {} {}",
+                name,
+                objects(ours[i]),
+                slot,
+                objects(theirs[i])
+            );
+        } else if (24..28).contains(&i) {
+            println!(
+                "    {:<20} local {:08x}  slot {} {:08x}",
                 name, ours[i], slot, theirs[i]
             );
         } else if i >= REGION_NAMES.len() - 2 {

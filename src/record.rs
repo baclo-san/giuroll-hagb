@@ -15,8 +15,10 @@
 //! name. Only the newest KEEP_FILES are kept.
 //!
 //! Layout, little-endian:
-//!   header:  b"G4R1", u8 players, u8 local_slot, u8 regions, u8 reserved,
-//!            u32 seed, u64 unix_time, [u8; 16] build (NUL padded)
+//!   header:  b"G4R2", u8 players, u8 local_slot, u8 regions, u8 reserved,
+//!            u32 seed, u64 unix_time, [u8; 16] build (NUL padded),
+//!            u8 character[4] (0xFF: no such player)
+//! G4R1 (4p-test-17/18) is the same without the characters.
 //!   frames:  u32 frame, u16 input[4], u32 region[regions]
 //! Inputs use giuroll's bit order: bit k = INPUT_KEYS_NUMBERS index k.
 
@@ -37,6 +39,22 @@ pub static mut DIR: Option<PathBuf> = None;
 /// are handed for a match and nothing else shares.
 unsafe fn match_seed() -> u32 {
     *(0x899D50 as *const u32)
+}
+
+/// Each player's character id (CharacterManager+0x34C), 0xFF where absent.
+unsafe fn characters() -> [u8; 4] {
+    let mut out = [0xFFu8; 4];
+    let bm = *(0x8985E4 as *const usize);
+    if !(0x00400000..0x7fff0000).contains(&bm) {
+        return out;
+    }
+    for (n, c) in out.iter_mut().enumerate() {
+        let p = *((bm + 0xc + n * 4) as *const usize);
+        if (0x00400000..0x7fff0000).contains(&p) {
+            *c = *((p + 0x34c) as *const u8);
+        }
+    }
+    out
 }
 
 /// Seat number written for a record made by replaying a match locally.
@@ -101,8 +119,8 @@ unsafe fn open(players: usize, local_slot: usize) {
         *b = c;
     }
 
-    let mut header = Vec::with_capacity(36);
-    header.extend_from_slice(b"G4R1");
+    let mut header = Vec::with_capacity(40);
+    header.extend_from_slice(b"G4R2");
     header.push(players as u8);
     header.push(local_slot as u8);
     header.push(crate::rollback::REGION_NAMES.len() as u8);
@@ -110,6 +128,9 @@ unsafe fn open(players: usize, local_slot: usize) {
     header.extend_from_slice(&seed.to_le_bytes());
     header.extend_from_slice(&unix.to_le_bytes());
     header.extend_from_slice(&build);
+    // Which characters: a desync is usually one character's move, and the
+    // 2026-10-12 one had to be matched to a lineup through the replay file.
+    header.extend_from_slice(&characters());
     if w.write_all(&header).is_err() {
         return;
     }

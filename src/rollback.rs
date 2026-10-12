@@ -428,7 +428,7 @@ pub static mut MEMORY_LEAK: usize = 0;
 /// how much health it has. They are what the simulation is FOR, they are
 /// identical on two machines in sync, and when they are not, the numbers
 /// themselves say what went wrong rather than merely that something did.
-pub const REGION_NAMES: [&str; 26] = [
+pub const REGION_NAMES: [&str; 30] = [
     "player 1 pos x",
     "player 1 pos y",
     "player 1 action/hp",
@@ -468,13 +468,29 @@ pub const REGION_NAMES: [&str; 26] = [
     "player 2 held",
     "player 3 held",
     "player 4 held",
-    // How many objects (projectiles, effects with hitboxes) each player owns.
-    // An attack that exists on one machine and not another is the usual way
-    // a hit lands on some screens only.
+    // Each player's objects (projectiles, effects with hitboxes): how many in
+    // the top byte, a hash of where they are, what they are doing and their
+    // hit state in the rest. An attack that exists on one machine and not
+    // another, or is one frame further along, is how a hit lands on some
+    // screens only.
+    //
+    // Until 4p-test-19 this read +0x180, which is the size of the player's
+    // CHILDREN list -- always 0 -- not its objects (+0x6F8, list at +0x58).
+    // So a 2026-10-12 desync where one machine missed the second hit of a
+    // multi-hit attack had nothing to show for the attack itself.
     "player 1 objects",
     "player 2 objects",
     "player 3 objects",
     "player 4 objects",
+    // A hash of each player's frame state (action, sequence, pose, frame
+    // counters) and hit state (HP, collision type and limit, hitstop, counter
+    // hit, forced counters, the timers after them). Position and HP alone say
+    // two machines disagree once a hit has landed; this says it a frame or
+    // more before, when the difference is still a timer.
+    "player 1 hit state",
+    "player 2 hit state",
+    "player 3 hit state",
+    "player 4 hit state",
     // The inputs the frame was simulated with, not state produced by it.
     //
     // Every desync report so far compared only STATE, which says the
@@ -569,11 +585,92 @@ unsafe fn compute_regions(p_battle_manager: usize) -> [u32; REGION_NAMES.len()] 
         }
         region_hashes[16 + n] = held;
 
-        // Object list: an LL3 at +0x17c, its count at +0x180.
-        let objects = *ptr_wrap!((p + 0x180) as *const u32);
-        region_hashes[20 + n] = if objects < 100_000 { objects } else { u32::MAX };
+        region_hashes[20 + n] = objects_hash(p);
+        region_hashes[24 + n] = hit_state_hash(p);
     }
     region_hashes
+}
+
+/// FNV-1a over a run of words.
+fn fnv(mut h: u32, words: impl Iterator<Item = u32>) -> u32 {
+    for w in words {
+        for b in w.to_le_bytes() {
+            h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+        }
+    }
+    h
+}
+
+const FNV_START: u32 = 0x811c_9dc5;
+
+/// The words of a game object that decide what it does next, with the mask of
+/// the bytes in each that are real fields: position, frame state (+0x13C) and
+/// hit state (+0x184). Shared by players and their objects -- both are
+/// GameObjectBase. No pointers, and no alignment padding: either can differ
+/// between machines in sync.
+const OBJECT_WORDS: [(usize, u32); 20] = [
+    (0xec, !0), // x
+    (0xf0, !0), // y
+    (0x13c, !0), // action, sequence
+    (0x140, !0), // pose, pose frame
+    (0x144, !0), // current frame
+    (0x148, !0), // sequence size, unknown
+    (0x14c, 0xffff), // pose duration
+    (0x184, !0), // HP, max HP
+    (0x188, !0),
+    (0x18c, 0xff), // skill index (then padding)
+    (0x190, !0), // collision type
+    (0x194, 0xffff_00ff), // collision limit, hitstop
+    (0x198, !0), // counter hit damage multiplier
+    (0x19c, !0),
+    (0x1a0, !0), // two flags, forced counter hits
+    (0x1a4, !0),
+    (0x1a8, !0),
+    (0x1ac, 0xff),
+    (0x1b4, 0xffff), // previous HP
+    (0x1b8, !0), // previous collision type
+];
+
+unsafe fn object_words(o: usize) -> impl Iterator<Item = u32> {
+    OBJECT_WORDS
+        .iter()
+        .map(move |&(off, mask)| *ptr_wrap!((o + off) as *const u32) & mask)
+}
+
+unsafe fn hit_state_hash(p: usize) -> u32 {
+    fnv(FNV_START, object_words(p))
+}
+
+/// Count in the top byte, hash of every object in list order below it.
+/// u32::MAX when the list cannot be walked.
+unsafe fn objects_hash(p: usize) -> u32 {
+    let plausible = |a: usize| (0x00400000..0x7fff0000).contains(&a);
+    // Player+0x6F8 is its object list; that list's std::list sits at +0x58:
+    // debug proxy, head node, size (0x4D2600 returns ecx+0x58).
+    let list = *ptr_wrap!((p + 0x6f8) as *const usize);
+    if !plausible(list) {
+        return u32::MAX;
+    }
+    let head = *ptr_wrap!((list + 0x5c) as *const usize);
+    let size = *ptr_wrap!((list + 0x60) as *const usize);
+    if !plausible(head) || size > 1024 {
+        return u32::MAX;
+    }
+    let mut h = FNV_START;
+    let mut node = *ptr_wrap!(head as *const usize);
+    let mut seen = 0usize;
+    while node != head {
+        if !plausible(node) || seen >= size {
+            return u32::MAX;
+        }
+        let obj = *ptr_wrap!((node + 8) as *const usize);
+        if plausible(obj) {
+            h = fnv(h, object_words(obj));
+        }
+        seen += 1;
+        node = *ptr_wrap!(node as *const usize);
+    }
+    ((seen.min(255) as u32) << 24) | (h & 0x00ff_ffff)
 }
 
 pub unsafe fn dump_frame(

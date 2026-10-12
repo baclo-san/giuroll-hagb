@@ -115,6 +115,10 @@ static mut ENABLE_PRINTLN: bool = false;
 static LOG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static LOG_LINES: AtomicUsize = AtomicUsize::new(0);
+/// The last line written, and how many times it has repeated since. Guarded by
+/// LOG_FILE's lock.
+static mut LOG_LAST: String = String::new();
+static mut LOG_REPEATS: usize = 0;
 
 /// Enough to cover a whole session; small enough that a site which fires every
 /// frame on a bad connection cannot fill a disk or spend the frame budget on
@@ -136,15 +140,26 @@ const LOG_LINE_CAP: usize = 20000;
 pub fn log_line(line: &str) {
     use std::io::Write;
 
+    let Ok(mut file) = LOG_FILE.lock() else {
+        return;
+    };
+
+    // A run of identical lines is one line and a count. "frame is missing"
+    // repeats every frame a peer is late, and on 2026-10-12 it used up the
+    // host's whole 20000 lines before the one match that desynced -- the log
+    // most needed was the one that had nothing in it.
+    unsafe {
+        if LOG_LAST == line {
+            LOG_REPEATS += 1;
+            return;
+        }
+    }
+
     let n = LOG_LINES.fetch_add(1, Relaxed);
 
     if n > LOG_LINE_CAP {
         return;
     }
-
-    let Ok(mut file) = LOG_FILE.lock() else {
-        return;
-    };
 
     if file.is_none() {
         let Ok(path) = LOG_PATH.lock() else {
@@ -165,6 +180,14 @@ pub fn log_line(line: &str) {
         return;
     }
 
+    unsafe {
+        if LOG_REPEATS > 0 {
+            let _ = writeln!(file, "  (repeated {} more times)", LOG_REPEATS);
+        }
+        LOG_REPEATS = 0;
+        LOG_LAST.clear();
+        LOG_LAST.push_str(line);
+    }
     let _ = writeln!(file, "{}", line);
     // Flushed per line on purpose: the interesting runs are the ones that end
     // in a crash, and a buffered tail is exactly the part that would be lost.
@@ -302,7 +325,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-18";
+const FOURP_BUILD: &str = "4p-test-19";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///
