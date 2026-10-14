@@ -25,6 +25,21 @@ HEADER = struct.Struct("<4sII")
 PLAYERS_SIZE = 2 * 44
 
 
+def normalize(x):
+    """Opposite directions held together, resolved as giuroll applies them.
+
+    A record holds the raw bits from the network, where up+down and
+    left+right both happen; giuroll turns either pair into up / left
+    (handle_raw_input). A .4p is fed to the game's own input update, which
+    need not resolve them the same way, so it gets the resolved input.
+    """
+    if x & 0x3 == 0x3:
+        x &= ~0x2
+    if x & 0xC == 0xC:
+        x &= ~0x8
+    return x
+
+
 def main(record_path, sidecar_path):
     rec = compare_records.load(record_path)
     with open(sidecar_path, "rb") as f:
@@ -45,7 +60,7 @@ def main(record_path, sidecar_path):
         # Record order is P1..P4 in giuroll bit order, which is 4PSoku's
         # Inputs bit order for the twelve bits both use; the sidecar wants
         # P3, P4, P1, P2.
-        ins = [x & 0xFFF for x in ins]
+        ins = [normalize(x & 0xFFF) for x in ins]
         entries.append(struct.pack("<4H", ins[2], ins[3], ins[0], ins[1]))
 
     backup = sidecar_path + ".v2.bak"
