@@ -1152,6 +1152,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         cfg!(feature = "allocconsole") || ISDEBUG,
     );
     let enable_check_mode = read_ini_bool(&conf, "Misc", "enable_check_mode", false);
+    let check_mode_start_frame = read_ini_int_hex(&conf, "Misc", "check_mode_start_frame", 1);
     let enable_mesh = read_ini_bool(&conf, "Netplay", "enable_mesh", true);
     let force_fpu_cw = read_ini_int_hex(&conf, "Netplay", "fpu_control_word", -1);
     let enable_sync_test = read_ini_bool(&conf, "Misc", "enable_sync_test", false);
@@ -1321,6 +1322,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
             println!("giuroll: mesh disabled by ini, every pair will use the relay");
         }
         ENABLE_CHECK_MODE = enable_check_mode;
+        replay::CHECK_START_FRAME = check_mode_start_frame.clamp(1, u32::MAX as i64) as u32;
         ENABLE_SYNC_TEST = enable_sync_test;
         WARNING_WHEN_LAGGING = warning_when_lagging;
         MAX_ROLLBACK_PREFERENCE = max_rollback_preference;

@@ -103,6 +103,12 @@ static mut REWIND_PRESSED_LAST_FRAME: bool = false;
 
 static mut REPLAY_KO_FRAMECOUNT: Option<usize> = None;
 
+/// First frame check mode's step 3 tests (giuroll.ini check_mode_start_frame).
+/// Step 3 rolls back 1..6 frames at every frame, so a whole 4P match takes a
+/// long time; a desync found online is at a known frame, and starting a few
+/// hundred frames before it is enough to see whether rollback reproduces it.
+pub static mut CHECK_START_FRAME: u32 = 1;
+
 static mut LAST_TARGET: Option<usize> = None;
 
 pub unsafe extern "cdecl" fn apause(_a: *mut ilhook::x86::Registers, _b: usize) {
@@ -788,6 +794,7 @@ pub unsafe fn handle_replay(
             if *old != *new {
                 check.is_failed = true;
                 println!("Difference at frame {} is determined.", *SOKU_FRAMECOUNT);
+                println!("differing: {}", old.diff_fields(new).join(", "));
                 println!("old: {:?}", old);
                 println!("new: {:?}", new);
                 println!("Continue or not? (Y or N, default N.)");
@@ -850,10 +857,13 @@ pub unsafe fn handle_replay(
                         check_failed();
                     } else {
                         println!("Step 2 is consistent with step 1. Step 2 pass!");
-                        println!("Step 3: replaying the replay with rollbacks everywhere");
-                        override_target_frame = Some(1);
+                        println!(
+                            "Step 3: replaying the replay with rollbacks at every frame from {}",
+                            CHECK_START_FRAME
+                        );
+                        override_target_frame = Some(CHECK_START_FRAME);
                         // apply_old_input();
-                        check.check_step = CheckStep::TestRollback(1, 1, false);
+                        check.check_step = CheckStep::TestRollback(CHECK_START_FRAME, 1, false);
                     }
                 } else {
                     override_target_frame = Some(*SOKU_FRAMECOUNT as u32 + 1);
