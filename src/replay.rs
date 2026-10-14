@@ -981,7 +981,12 @@ pub unsafe fn handle_replay(
                     }
                     // println!("{:?}", check.check_step);
                 } else {
-                    if !stepping {
+                    // Frames before the tested one are the run-up from the
+                    // nearest savestate (every 16th frame before step 3):
+                    // play them as recorded. Only check_mode_start_frame
+                    // has a run-up; feeding it mispredicted input made every
+                    // test from there start from a wrong state.
+                    if !stepping && *SOKU_FRAMECOUNT as u32 >= being_tested_frame {
                         apply_old_input();
                         // override_target_frame = Some(*SOKU_FRAMECOUNT as u32 + 1);
                     }
