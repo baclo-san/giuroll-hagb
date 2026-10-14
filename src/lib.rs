@@ -325,7 +325,7 @@ const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 /// the previous session entirely -- neither is visible in a log that does not
 /// say which build wrote it. Matching the tag means a log can be tied to a
 /// download without having to ask anyone what they installed.
-const FOURP_BUILD: &str = "4p-test-19";
+const FOURP_BUILD: &str = "4p-test-20";
 
 /// The x87 control word to force each frame, or -1 to leave it alone.
 ///

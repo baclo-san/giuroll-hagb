@@ -440,6 +440,33 @@ pub(crate) fn four_player_local_slot() -> Option<usize> {
     }
 }
 
+/// Tell 4PSoku a frame is final: every player's input for it is known and it
+/// was simulated with exactly those. 4PSoku sends final frames to the relay,
+/// which streams them to spectators -- this is what makes a frame safe to
+/// show them, since nothing will roll it back any more.
+///
+/// The export is looked up once 4PSoku is loaded, and only then: an older
+/// 4PSoku without it simply has no spectator feed.
+pub unsafe fn four_player_frame_confirmed(frame: usize) {
+    static mut CACHED: Option<extern "C" fn(u32)> = None;
+    static mut LOOKED: bool = false;
+
+    if !LOOKED {
+        if !four_player_mod_loaded() {
+            return;
+        }
+        LOOKED = true;
+        if let Ok(module) = GetModuleHandleA(windows::core::s!("4PSoku.dll")) {
+            if let Some(proc) = GetProcAddress(module, windows::core::s!("FourPSokuFrameConfirmed")) {
+                CACHED = Some(std::mem::transmute(proc));
+            }
+        }
+    }
+    if let Some(confirmed) = CACHED {
+        confirmed(frame as u32);
+    }
+}
+
 /// Where 4PSoku keeps its own simulation state, as (address, size).
 ///
 /// The mod has counters of its own that decide what happens in a match -- the

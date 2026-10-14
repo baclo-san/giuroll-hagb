@@ -242,6 +242,9 @@ impl Rollbacker {
             self.region_hashes.insert(m.prev_state.number, region_hashes);
             // Confirmed: this is the frame as it will stand on every machine.
             unsafe { crate::record::frame(m.prev_state.number, &m.inputs, &region_hashes) };
+            if self.players > 2 {
+                unsafe { crate::replay::four_player_frame_confirmed(m.prev_state.number) };
+            }
             m.prev_state.did_happen();
             #[cfg(feature = "logrollback")]
             println!("did_happen {}", m.prev_state.number);
