@@ -66,7 +66,7 @@ pub unsafe fn start(players: usize, local_slot: usize) {
     if players <= 2 {
         return;
     }
-    open(players, local_slot);
+    open(players, local_slot, "");
 }
 
 /// Start a record of a replay being played back -- the same match, simulated
@@ -75,7 +75,18 @@ pub unsafe fn start(players: usize, local_slot: usize) {
 pub unsafe fn start_playback() {
     finish();
     if crate::replay::four_player_mod_loaded() {
-        open(4, PLAYBACK_SLOT);
+        open(4, PLAYBACK_SLOT, "playback");
+    }
+}
+
+/// The same, for the first pass of check mode, as `<seed>-check.g4r`: check
+/// mode steps a replay differently from normal playback (several frames per
+/// display tick), and when its pass and a normal one disagree, this is how to
+/// see where.
+pub unsafe fn start_check_playback() {
+    finish();
+    if crate::replay::four_player_mod_loaded() {
+        open(4, PLAYBACK_SLOT, "check");
     }
 }
 
@@ -89,7 +100,7 @@ pub unsafe fn playback_frame(number: usize) {
     frame(number, &[], &regions);
 }
 
-unsafe fn open(players: usize, local_slot: usize) {
+unsafe fn open(players: usize, local_slot: usize, tag: &str) {
     let Some(dir) = DIR.as_ref() else {
         return;
     };
@@ -102,7 +113,7 @@ unsafe fn open(players: usize, local_slot: usize) {
 
     let seed = match_seed();
     let path = dir.join(match local_slot {
-        PLAYBACK_SLOT => format!("{:08x}-playback.g4r", seed),
+        PLAYBACK_SLOT => format!("{:08x}-{}.g4r", seed, tag),
         n => format!("{:08x}-slot{}.g4r", seed, n),
     });
     let Ok(file) = std::fs::File::create(&path) else {

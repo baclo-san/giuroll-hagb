@@ -108,6 +108,7 @@ static mut REPLAY_KO_FRAMECOUNT: Option<usize> = None;
 /// hundred frames before it is enough to see whether rollback reproduces it.
 pub static mut CHECK_START_FRAME: u32 = 1;
 static mut CHECK_DIFFERENCES: usize = 0;
+static mut CHECK_RECORD_STARTED: bool = false;
 
 static mut LAST_TARGET: Option<usize> = None;
 
@@ -663,6 +664,7 @@ pub unsafe fn handle_replay(
             let _ = AllocConsole();
             println!("Enter check mode.");
             CHECK_DIFFERENCES = 0;
+            CHECK_RECORD_STARTED = false;
             println!("Start step 1: playing the replay normally.");
             DISABLE_SOUND = true;
             CHECK = Some(Check {
@@ -1188,6 +1190,18 @@ pub unsafe fn handle_replay(
             crate::record::start_playback();
         }
         crate::record::playback_frame(framecount);
+    } else if let Some(check) = CHECK.as_ref() {
+        // Step 1 only: one straight pass, like the normal playback record.
+        if matches!(check.check_step, CheckStep::TestPlay1) {
+            if framecount == 1 && !CHECK_RECORD_STARTED {
+                CHECK_RECORD_STARTED = true;
+                crate::record::start_check_playback();
+            }
+            crate::record::playback_frame(framecount);
+        } else if CHECK_RECORD_STARTED {
+            CHECK_RECORD_STARTED = false;
+            crate::record::finish();
+        }
     }
 
     if framecount == 1
