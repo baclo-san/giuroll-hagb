@@ -608,7 +608,7 @@ const FNV_START: u32 = 0x811c_9dc5;
 /// hit state (+0x184). Shared by players and their objects -- both are
 /// GameObjectBase. No pointers, and no alignment padding: either can differ
 /// between machines in sync.
-const OBJECT_WORDS: [(usize, u32); 20] = [
+const OBJECT_WORDS: [(usize, u32); 18] = [
     (0xec, !0), // x
     (0xf0, !0), // y
     (0x13c, !0), // action, sequence
@@ -627,9 +627,13 @@ const OBJECT_WORDS: [(usize, u32); 20] = [
     (0x1a4, !0),
     (0x1a8, !0),
     (0x1ac, 0xff),
-    (0x1b4, 0xffff), // previous HP
-    (0x1b8, !0), // previous collision type
+    // Not +0x1B4 / +0x1B8 (previous HP, previous collision type): scratch the
+    // engine writes before it reads, and left as whatever the heap held in a
+    // new object -- check mode saw a fresh doll with ff000e00 there in one run
+    // and 00000001 after rewinding, everything else equal.
 ];
+
+pub const OBJECT_WORD_COUNT: usize = OBJECT_WORDS.len();
 
 unsafe fn object_words(o: usize) -> impl Iterator<Item = u32> {
     OBJECT_WORDS

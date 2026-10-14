@@ -11,7 +11,6 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::Write,
     iter::Empty,
     os::raw::c_void,
     sync::atomic::{AtomicU8, Ordering::Relaxed},
@@ -108,6 +107,7 @@ static mut REPLAY_KO_FRAMECOUNT: Option<usize> = None;
 /// long time; a desync found online is at a known frame, and starting a few
 /// hundred frames before it is enough to see whether rollback reproduces it.
 pub static mut CHECK_START_FRAME: u32 = 1;
+static mut CHECK_DIFFERENCES: usize = 0;
 
 static mut LAST_TARGET: Option<usize> = None;
 
@@ -537,7 +537,7 @@ pub(crate) struct CheckData {
 }
 
 #[derive(Eq, PartialEq)]
-struct ObjectWords([Vec<[u32; 20]>; 4]);
+struct ObjectWords([Vec<[u32; crate::rollback::OBJECT_WORD_COUNT]>; 4]);
 
 impl std::fmt::Debug for ObjectWords {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -662,6 +662,7 @@ pub unsafe fn handle_replay(
             DUMP_FRAME_TIME = Some(Duration::ZERO);
             let _ = AllocConsole();
             println!("Enter check mode.");
+            CHECK_DIFFERENCES = 0;
             println!("Start step 1: playing the replay normally.");
             DISABLE_SOUND = true;
             CHECK = Some(Check {
@@ -845,28 +846,16 @@ pub unsafe fn handle_replay(
                 }
                 println!("old: {:?}", old);
                 println!("new: {:?}", new);
-                println!("Continue or not? (Y or N, default N.)");
-                print!("> ");
-                let _ = std::io::stdout().flush();
-                loop {
-                    let mut buf = String::new();
-                    match std::io::stdin().read_line(&mut buf) {
-                        Ok(_) => match buf.as_str().trim() {
-                            "y" | "Y" => {
-                                println!("Continue...");
-                                return false;
-                            }
-                            "n" | "N" | _ => {
-                                println!("The test has been failed.");
-                                return true;
-                            }
-                        },
-                        Err(e) => {
-                            println!("Warning: can't read stdin: {}", e.to_string());
-                            return true;
-                        }
-                    }
+                // No question on the console: its stdin is not reliably
+                // attached (an answer of "y" read as nothing, 2026-10-14), and
+                // several differences say more than one. Stop at the fifth.
+                CHECK_DIFFERENCES += 1;
+                if CHECK_DIFFERENCES >= 5 {
+                    println!("Five differences; stopping.");
+                    return true;
                 }
+                println!("Continuing ({} of 5).", CHECK_DIFFERENCES);
+                return false;
             }
             return false;
         };
