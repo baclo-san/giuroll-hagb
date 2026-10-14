@@ -643,34 +643,74 @@ unsafe fn hit_state_hash(p: usize) -> u32 {
 
 /// Count in the top byte, hash of every object in list order below it.
 /// u32::MAX when the list cannot be walked.
-unsafe fn objects_hash(p: usize) -> u32 {
+/// A player's objects in list order (null entries kept as 0), or None when
+/// the list cannot be walked.
+unsafe fn object_list(p: usize) -> Option<Vec<usize>> {
     let plausible = |a: usize| (0x00400000..0x7fff0000).contains(&a);
     // Player+0x6F8 is its object list; that list's std::list sits at +0x58:
     // debug proxy, head node, size (0x4D2600 returns ecx+0x58).
     let list = *ptr_wrap!((p + 0x6f8) as *const usize);
     if !plausible(list) {
-        return u32::MAX;
+        return None;
     }
     let head = *ptr_wrap!((list + 0x5c) as *const usize);
     let size = *ptr_wrap!((list + 0x60) as *const usize);
     if !plausible(head) || size > 1024 {
-        return u32::MAX;
+        return None;
     }
-    let mut h = FNV_START;
+    let mut out = Vec::with_capacity(size);
     let mut node = *ptr_wrap!(head as *const usize);
-    let mut seen = 0usize;
     while node != head {
-        if !plausible(node) || seen >= size {
-            return u32::MAX;
+        if !plausible(node) || out.len() >= size {
+            return None;
         }
         let obj = *ptr_wrap!((node + 8) as *const usize);
-        if plausible(obj) {
-            h = fnv(h, object_words(obj));
-        }
-        seen += 1;
+        out.push(if plausible(obj) { obj } else { 0 });
         node = *ptr_wrap!(node as *const usize);
     }
-    ((seen.min(255) as u32) << 24) | (h & 0x00ff_ffff)
+    Some(out)
+}
+
+unsafe fn objects_hash(p: usize) -> u32 {
+    let Some(objects) = object_list(p) else {
+        return u32::MAX;
+    };
+    let mut h = FNV_START;
+    for &obj in objects.iter().filter(|o| **o != 0) {
+        h = fnv(h, object_words(obj));
+    }
+    ((objects.len().min(255) as u32) << 24) | (h & 0x00ff_ffff)
+}
+
+/// Offsets of the words OBJECT_WORDS hashes, for printing a difference.
+pub fn object_word_offsets() -> impl Iterator<Item = usize> {
+    OBJECT_WORDS.iter().map(|(off, _)| *off)
+}
+
+/// Every object of every player, as the masked words the hash is made of.
+/// For check mode: when a hash differs, which object and which field.
+pub unsafe fn object_words_all() -> [Vec<[u32; OBJECT_WORDS.len()]>; 4] {
+    let mut out: [Vec<[u32; OBJECT_WORDS.len()]>; 4] = Default::default();
+    let bm = *(0x8985E4 as *const usize);
+    if !(0x00400000..0x7fff0000).contains(&bm) {
+        return out;
+    }
+    for (n, slot) in out.iter_mut().enumerate() {
+        let p = *ptr_wrap!((bm + 0xc + n * 4) as *const usize);
+        if !(0x00400000..0x7fff0000).contains(&p) {
+            continue;
+        }
+        for obj in object_list(p).unwrap_or_default() {
+            let mut w = [0u32; OBJECT_WORDS.len()];
+            if obj != 0 {
+                for (dst, v) in w.iter_mut().zip(object_words(obj)) {
+                    *dst = v;
+                }
+            }
+            slot.push(w);
+        }
+    }
+    out
 }
 
 pub unsafe fn dump_frame(

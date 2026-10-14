@@ -531,6 +531,50 @@ pub(crate) struct CheckData {
     /// hits someone -- usually after the test's few frames have run -- so the
     /// test passed while online play desynced on exactly that (2026-10-12).
     regions: [u32; STATE_REGIONS],
+    /// Each player's objects, word by word: what the objects hashes are made
+    /// of, so a difference in one can be traced to an object and a field.
+    objects: ObjectWords,
+}
+
+#[derive(Eq, PartialEq)]
+struct ObjectWords([Vec<[u32; 20]>; 4]);
+
+impl std::fmt::Debug for ObjectWords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let counts: Vec<usize> = self.0.iter().map(|v| v.len()).collect();
+        write!(f, "objects per player {:?}", counts)
+    }
+}
+
+impl CheckData {
+    /// Lines naming each object field that differs, as "p4 object 1 +0x13c:
+    /// 00020006 -> 00020007".
+    pub(crate) fn object_differences(&self, other: &Self) -> Vec<String> {
+        let mut out = Vec::new();
+        let offsets: Vec<usize> = crate::rollback::object_word_offsets().collect();
+        for p in 0..4 {
+            let (a, b) = (&self.objects.0[p], &other.objects.0[p]);
+            if a.len() != b.len() {
+                out.push(format!("p{} has {} objects, then {}", p + 1, a.len(), b.len()));
+                continue;
+            }
+            for (k, (wa, wb)) in a.iter().zip(b.iter()).enumerate() {
+                for (i, off) in offsets.iter().enumerate() {
+                    if wa[i] != wb[i] {
+                        out.push(format!(
+                            "p{} object {} +0x{:x}: {:08x} -> {:08x}",
+                            p + 1,
+                            k,
+                            off,
+                            wa[i],
+                            wb[i]
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 const STATE_REGIONS: usize = crate::rollback::REGION_NAMES.len() - 2;
@@ -580,6 +624,7 @@ impl CheckData {
             regions: crate::rollback::region_values()[..STATE_REGIONS]
                 .try_into()
                 .unwrap(),
+            objects: ObjectWords(crate::rollback::object_words_all()),
         }
     }
 }
@@ -795,6 +840,9 @@ pub unsafe fn handle_replay(
                 check.is_failed = true;
                 println!("Difference at frame {} is determined.", *SOKU_FRAMECOUNT);
                 println!("differing: {}", old.diff_fields(new).join(", "));
+                for line in old.object_differences(new) {
+                    println!("  {}", line);
+                }
                 println!("old: {:?}", old);
                 println!("new: {:?}", new);
                 println!("Continue or not? (Y or N, default N.)");
