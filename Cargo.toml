@@ -1,6 +1,6 @@
 cargo-features = ["profile-rustflags"]
 [package]
-name = "giuroll"
+name = "giuroll-4p"
 authors = ["Giufin (2023~2024)", "Hagb (Junyu Guo) <hagb@hagb.name> (2024)"]
 license = "MIT"
 # Increase DLL_REVISION in build.rs when pre-release version is bumped or removed with fixed major.minor.patch version, and
@@ -8,12 +8,15 @@ license = "MIT"
 version = "0.6.18"
 edition = "2021"
 build = "build.rs"
-description = "A network rollback mod for 東方非想天則 / Touhou 12.3 Hisoutensoku, with also support for replay rewind and takeover"
+description = "giuroll for 4PSoku four-player matches: a network rollback mod for 東方非想天則 / Touhou 12.3 Hisoutensoku, with also support for replay rewind and takeover"
 homepage = "https://github.com/Hagb/giuroll-hagb"
 repository = "https://github.com/Hagb/giuroll-hagb"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
+# giuroll4p.dll: giuroll for 4PSoku, named apart from upstream giuroll.dll
+# so nobody mistakes one for the other.
+name = "giuroll4p"
 crate-type = ["cdylib"]
 
 [features]

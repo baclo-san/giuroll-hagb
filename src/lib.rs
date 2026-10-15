@@ -111,7 +111,7 @@ pub fn set_up_fern() -> Result<(), fern::InitError> {
 
 static mut ENABLE_PRINTLN: bool = false;
 
-/// Where giuroll.log is written. Set during init, next to giuroll.ini.
+/// Where giuroll4p.log is written. Set during init, next to giuroll4p.ini.
 static LOG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static LOG_LINES: AtomicUsize = AtomicUsize::new(0);
@@ -125,7 +125,7 @@ static mut LOG_REPEATS: usize = 0;
 /// flushes. Being cut off is stated in the file rather than left as a silence.
 const LOG_LINE_CAP: usize = 20000;
 
-/// Append one diagnostic line to giuroll.log.
+/// Append one diagnostic line to giuroll4p.log.
 ///
 /// WHY A FILE AND NOT JUST STDOUT. `enable_println` decides whether these lines
 /// are produced, not whether anyone can read them -- and until now the answer to
@@ -200,7 +200,7 @@ macro_rules! println {
         use crate::ENABLE_PRINTLN;
         use crate::replay::CHECK;
         #[allow(unused_unsafe)]
-        // giuroll.log is written whatever enable_println says; only the
+        // giuroll4p.log is written whatever enable_println says; only the
         // console is gated on it. The ini shipped with giuroll sets
         // enable_println=no, so every player who installed from it wrote no
         // log at all -- two of four machines in a 2026-09-30 session, and
@@ -1028,12 +1028,21 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         let mut p = filename.clone();
 
         unsafe { record::DIR = Some(p.clone()) };
-        p.push("giuroll.log");
+        p.push("giuroll4p.log");
         *path = Some(p);
     }
 
-    let mut filepath = filename;
-    filepath.push("giuroll.ini");
+    // giuroll4p.ini; an existing giuroll.ini next to the DLL is still read, so
+    // settings carry over when giuroll4p.dll replaces giuroll.dll in place.
+    let mut filepath = filename.clone();
+    filepath.push("giuroll4p.ini");
+    if !filepath.exists() {
+        let mut old = filename;
+        old.push("giuroll.ini");
+        if old.exists() {
+            filepath = old;
+        }
+    }
     //println!("{:?}", filepath);
 
     let conf = match mininip::parse::parse_file(filepath) {
@@ -1269,7 +1278,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         .to_string(),
     );
 
-    let verstr = format!("Giuroll {}", verstr);
+    let verstr = format!("Giuroll-4P {}", verstr);
 
     let title = title.replace('$', &verstr);
 
@@ -1313,7 +1322,7 @@ fn truer_exec(filename: PathBuf, pretend_to_be_vanilla: bool) -> Result<(), Stri
         // is silently dropped. The previous build did exactly that and
         // shipped a version stamp that never appeared in a single log.
         println!(
-            "giuroll {} ({}) -- quote this build when reporting a 4P session",
+            "giuroll-4p {} ({}) -- quote this build when reporting a 4P session",
             VERSION_STR, FOURP_BUILD
         );
         FORCE_FPU_CW = force_fpu_cw;

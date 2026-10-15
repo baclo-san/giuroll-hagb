@@ -4,7 +4,7 @@
     python compare_records.py FILE.g4r FILE.g4r [...]
     python compare_records.py DIRECTORY          # every match found in it
 
-Each machine writes records/<seed>-slot<N>.g4r beside giuroll.ini; collect
+Each machine writes records/<seed>-slot<N>.g4r beside giuroll4p.ini; collect
 them from all players into one folder. Files are grouped by match seed.
 Playing the match's replay back writes <seed>-playback.g4r: the same match
 simulated once, without rollback, to say which machines were right.

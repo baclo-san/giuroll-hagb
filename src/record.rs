@@ -10,7 +10,7 @@
 //! all peers' inputs for it confirmed. The values are the same region values
 //! the desync report compares, so the two always agree.
 //!
-//! Files go to `records/` beside giuroll.ini, named `<seed>-slot<N>.g4r`: the
+//! Files go to `records/` beside giuroll4p.ini, named `<seed>-slot<N>.g4r`: the
 //! match seed is shared by all four machines, so matching files pair up by
 //! name. Only the newest KEEP_FILES are kept.
 //!
@@ -32,7 +32,7 @@ const KEEP_FILES: usize = 40;
 
 static mut WRITER: Option<BufWriter<std::fs::File>> = None;
 static mut WRITTEN: usize = 0;
-/// Directory giuroll.ini lives in; set during init.
+/// Directory giuroll4p.ini lives in; set during init.
 pub static mut DIR: Option<PathBuf> = None;
 
 /// gameParams.randomSeed (0x899D08 + 0x48), the one value all four machines

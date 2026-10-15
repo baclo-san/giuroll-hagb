@@ -102,7 +102,7 @@ static mut REWIND_PRESSED_LAST_FRAME: bool = false;
 
 static mut REPLAY_KO_FRAMECOUNT: Option<usize> = None;
 
-/// First frame check mode's step 3 tests (giuroll.ini check_mode_start_frame).
+/// First frame check mode's step 3 tests (giuroll4p.ini check_mode_start_frame).
 /// Step 3 rolls back 1..6 frames at every frame, so a whole 4P match takes a
 /// long time; a desync found online is at a known frame, and starting a few
 /// hundred frames before it is enough to see whether rollback reproduces it.
